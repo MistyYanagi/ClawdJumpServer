@@ -311,7 +311,9 @@ pub enum OpenReply {
 pub const MAX_STREAM_MSG: usize = 1024 * 1024;
 
 /// Actions a grant can allow. Each stream kind maps to exactly one action.
+/// Serialized (JSON) with the same names as [`Action::as_str`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Action {
     Shell,
     Exec,

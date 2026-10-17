@@ -1,6 +1,26 @@
 [package]
 name = "cjs-ctl"
-version = "0.1.0"
-edition = "2024"
+description = "ClawdJumpServer administration CLI (cjsctl)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "cjsctl"
+path = "src/main.rs"
 
 [dependencies]
+cjs-proto.workspace = true
+cjs-transport.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+dirs.workspace = true
+rpassword.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

@@ -105,6 +105,11 @@ pub async fn enroll(
     version: &str,
 ) -> Result<Profile, ProtoError> {
     let tok = EnrollToken::parse(token)?;
+    // Store an absolute CA path: the daemon may run from another directory.
+    let ca = match ca {
+        Some(p) => Some(std::fs::canonicalize(&p).map_err(|e| bad(format!("{}: {e}", p.display())))?),
+        None => None,
+    };
     std::fs::create_dir_all(dir).map_err(|e| ProtoError::new(ErrorCode::Io, e.to_string()))?;
     restrict_dir(dir);
     let key = StaticKeypair::load_or_create(&dir.join(KEY_FILE))?;

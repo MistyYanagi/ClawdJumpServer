@@ -337,6 +337,8 @@ pub struct Shared {
     pub cfg: ServerConfig,
     pub reg: Registry,
     stream_seq: AtomicU32,
+    /// Failed web logins per client address: (count, window start).
+    pub login_failures: Mutex<HashMap<String, (u32, i64)>>,
 }
 
 impl std::fmt::Debug for Shared {
@@ -361,6 +363,7 @@ impl Shared {
             cfg,
             reg: Registry::default(),
             stream_seq: AtomicU32::new(1),
+            login_failures: Mutex::new(HashMap::new()),
         }
     }
 

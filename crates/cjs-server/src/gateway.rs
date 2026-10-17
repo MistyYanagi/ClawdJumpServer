@@ -432,8 +432,15 @@ impl Server {
 }
 
 impl Server {
-    /// All HTTP routes: transport endpoints (`/v1/t/*`).
+    /// All HTTP routes: transport (`/v1/t/*`), REST API (`/api/v1/*`) and
+    /// the web UI, with security headers on every response. Serve it with
+    /// `into_make_service_with_connect_info::<SocketAddr>()` so client
+    /// addresses are audited.
     pub fn router(&self) -> axum::Router {
-        self.transport.router()
+        self.transport
+            .router()
+            .merge(crate::api::router(self.clone()))
+            .fallback(crate::web::static_file)
+            .layer(axum::middleware::from_fn(crate::web::security_headers))
     }
 }

@@ -91,13 +91,13 @@ landlock = "0.4"
 rlimit = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 toml = "0.8"
-utoipa = { version = "5", features = ["axum_extras"] }
 rust-embed = { version = "8", features = ["include-exclude"] }
 mime_guess = "2"
 ipnet = "2"
 url = "2"
 dirs = "5"
 crossterm = "0.28"
+rpassword = "7"
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 humantime = "2"
