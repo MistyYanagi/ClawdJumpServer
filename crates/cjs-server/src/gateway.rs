@@ -231,6 +231,23 @@ impl Server {
                 enforce(&sh);
             }
         });
+        // Sign the audit head regularly so the unsigned tail stays short.
+        let weak = Arc::downgrade(&srv.shared);
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                t.tick().await;
+                let Some(sh) = weak.upgrade() else { return };
+                let (head, cp) = (sh.audit.head_seq(), sh.audit.last_checkpoint());
+                if let (Ok(h), Ok(c)) = (head, cp) {
+                    if h > c {
+                        if let Err(e) = sh.audit.checkpoint() {
+                            tracing::error!(err = %e, "audit checkpoint failed");
+                        }
+                    }
+                }
+            }
+        });
         srv
     }
 

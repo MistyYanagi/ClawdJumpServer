@@ -3,10 +3,10 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
 use cjs_proto::Role as ClientRole;
 use cjs_server::db::Db;
 use cjs_server::{accounts, Keys, Server, ServerConfig};
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "cjs-server", version, about = "ClawdJumpServer bastion server")]
@@ -73,7 +73,8 @@ fn die(m: impl std::fmt::Display) -> ! {
 fn open(data: &Path) -> (Keys, Db, cjs_audit::AuditLog) {
     let keys = Keys::load_or_create(data).unwrap_or_else(|e| die(e));
     let db = Db::open(&data.join("cjs.db")).unwrap_or_else(|e| die(e));
-    let audit = cjs_audit::AuditLog::open(&data.join("audit.db"), keys.audit.clone()).unwrap_or_else(|e| die(e));
+    let audit =
+        cjs_audit::AuditLog::open(&data.join("audit.db"), keys.audit.clone()).unwrap_or_else(|e| die(e));
     (keys, db, audit)
 }
 
@@ -124,7 +125,10 @@ fn main() {
                 let (row, token) = srv
                     .create_enroll_token(kind, &name, owner.as_deref(), "system:cli", ttl)
                     .unwrap_or_else(|e| die(e));
-                eprintln!("token {} for {} {name}, expires at {}", row.id, row.kind, row.expires_at);
+                eprintln!(
+                    "token {} for {} {name}, expires at {}",
+                    row.id, row.kind, row.expires_at
+                );
                 println!("{token}");
             }
             Cmd::AuditVerify => {
@@ -140,8 +144,14 @@ fn main() {
                 let keys = Keys::load_or_create(&cli.data).unwrap_or_else(|e| die(e));
                 println!("server key:     {}", hex::encode(keys.noise.public));
                 println!("fingerprint:    {}", keys.noise.fingerprint());
-                println!("capability key: {}", hex::encode(keys.cap.verifying_key().as_bytes()));
-                println!("audit key:      {}", hex::encode(keys.audit.verifying_key().as_bytes()));
+                println!(
+                    "capability key: {}",
+                    hex::encode(keys.cap.verifying_key().as_bytes())
+                );
+                println!(
+                    "audit key:      {}",
+                    hex::encode(keys.audit.verifying_key().as_bytes())
+                );
             }
         }
     });
@@ -162,13 +172,22 @@ fn init(data: &Path, admin: &str, hostnames: Vec<String>) {
         cjs_transport::keys::write_secret_file(&tls.join("key.pem"), ck.key_pair.serialize_pem().as_bytes())
             .unwrap_or_else(|e| die(e));
     }
-    let nu = accounts::create_user(admin, vec![cjs_authz::Role::Sysadmin, cjs_authz::Role::Secadmin], None)
-        .unwrap_or_else(|e| die(e));
+    let nu = accounts::create_user(
+        admin,
+        vec![cjs_authz::Role::Sysadmin, cjs_authz::Role::Secadmin],
+        None,
+    )
+    .unwrap_or_else(|e| die(e));
     audit
         .append(
-            cjs_audit::Event::new("admin.init", "system:cli", &nu.user.id, cjs_audit::Outcome::Success)
-                .highlight(true)
-                .data(serde_json::json!({"admin": admin})),
+            cjs_audit::Event::new(
+                "admin.init",
+                "system:cli",
+                &nu.user.id,
+                cjs_audit::Outcome::Success,
+            )
+            .highlight(true)
+            .data(serde_json::json!({"admin": admin})),
         )
         .unwrap_or_else(|e| die(e));
     db.insert_user(&nu.user).unwrap_or_else(|e| die(e));
@@ -177,27 +196,39 @@ fn init(data: &Path, admin: &str, hostnames: Vec<String>) {
     println!("administrator:  {admin}  (roles: sysadmin, secadmin)");
     println!("password:       {}", nu.password);
     println!("TOTP secret:    {}", nu.totp_secret);
-    println!("TOTP URL:       {}", accounts::otpauth_url(&nu.totp_secret, admin));
+    println!(
+        "TOTP URL:       {}",
+        accounts::otpauth_url(&nu.totp_secret, admin)
+    );
     println!();
     println!("server key:     {}", hex::encode(keys.noise.public));
-    println!("TLS cert:       {} (self-signed for {})", cert_path.display(), hostnames.join(", "));
+    println!(
+        "TLS cert:       {} (self-signed for {})",
+        cert_path.display(),
+        hostnames.join(", ")
+    );
     println!();
     println!("Next: create an auditor and a second secadmin (two-person rule), e.g. with cjsctl.");
 }
 
 fn load_tls(cert: &Path, key: &Path) -> Arc<rustls::ServerConfig> {
-    let certs = rustls_pemfile::certs(&mut &std::fs::read(cert).unwrap_or_else(|e| die(format!("{}: {e}", cert.display())))[..])
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap_or_else(|e| die(format!("{}: {e}", cert.display())));
-    let key = rustls_pemfile::private_key(&mut &std::fs::read(key).unwrap_or_else(|e| die(format!("{}: {e}", key.display())))[..])
-        .unwrap_or_else(|e| die(format!("{}: {e}", key.display())))
-        .unwrap_or_else(|| die(format!("{}: no private key", key.display())));
-    let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .unwrap_or_else(|e| die(e))
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .unwrap_or_else(|e| die(e));
+    let certs = rustls_pemfile::certs(
+        &mut &std::fs::read(cert).unwrap_or_else(|e| die(format!("{}: {e}", cert.display())))[..],
+    )
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap_or_else(|e| die(format!("{}: {e}", cert.display())));
+    let key = rustls_pemfile::private_key(
+        &mut &std::fs::read(key).unwrap_or_else(|e| die(format!("{}: {e}", key.display())))[..],
+    )
+    .unwrap_or_else(|e| die(format!("{}: {e}", key.display())))
+    .unwrap_or_else(|| die(format!("{}: no private key", key.display())));
+    let mut cfg =
+        rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap_or_else(|e| die(e))
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap_or_else(|e| die(e));
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Arc::new(cfg)
 }
@@ -230,13 +261,25 @@ async fn run(
     tracing::info!(%listen, %fingerprint, tls = !no_tls, "ClawdJumpServer listening");
     let shared = srv.shared.clone();
     tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .unwrap_or_else(|e| die(e));
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
         let _ = tokio::signal::ctrl_c().await;
         let _ = shared.audit.checkpoint();
         tracing::info!("shutting down");
         std::process::exit(0);
     });
     if no_tls {
-        let l = tokio::net::TcpListener::bind(listen).await.unwrap_or_else(|e| die(e));
+        let l = tokio::net::TcpListener::bind(listen)
+            .await
+            .unwrap_or_else(|e| die(e));
         axum::serve(
             axum::serve::ListenerExt::tap_io(l, |t| {
                 let _ = t.set_nodelay(true);
@@ -249,7 +292,8 @@ async fn run(
         let cert = tls_cert.unwrap_or_else(|| data.join("tls/cert.pem"));
         let key = tls_key.unwrap_or_else(|| data.join("tls/key.pem"));
         let tls = axum_server::tls_rustls::RustlsConfig::from_config(load_tls(&cert, &key));
-        let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(tls).acceptor(axum_server::accept::NoDelayAcceptor::new());
+        let acceptor = axum_server::tls_rustls::RustlsAcceptor::new(tls)
+            .acceptor(axum_server::accept::NoDelayAcceptor::new());
         axum_server::bind(listen)
             .acceptor(acceptor)
             .serve(app)

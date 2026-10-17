@@ -91,8 +91,12 @@ impl Drop for RawGuard {
     }
 }
 
+/// Terminal size, with a sane default when it is unknown (some ptys
+/// report 0x0) and clamped to what the server accepts.
 fn size() -> (u16, u16) {
-    crossterm::terminal::size().unwrap_or((80, 24))
+    let (c, r) = crossterm::terminal::size().unwrap_or((80, 24));
+    let fix = |v: u16, d: u16| if v == 0 { d } else { v.min(cjs_proto::MAX_TERM_DIM) };
+    (fix(c, 80), fix(r, 24))
 }
 
 pub fn term_name() -> String {

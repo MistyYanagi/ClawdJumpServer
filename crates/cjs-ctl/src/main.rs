@@ -77,16 +77,24 @@ enum UserCmd {
         #[arg(long)]
         expires_at: Option<i64>,
     },
-    Disable { user: String },
-    Enable { user: String },
+    Disable {
+        user: String,
+    },
+    Enable {
+        user: String,
+    },
     /// Replace a user's roles.
     Roles {
         user: String,
         #[arg(value_delimiter = ',')]
         roles: Vec<String>,
     },
-    Reset { user: String },
-    Unlock { user: String },
+    Reset {
+        user: String,
+    },
+    Unlock {
+        user: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -108,9 +116,17 @@ enum GroupCmd {
         #[arg(long, default_value = "")]
         description: String,
     },
-    Delete { group: String },
-    Add { group: String, member: String },
-    Remove { group: String, member: String },
+    Delete {
+        group: String,
+    },
+    Add {
+        group: String,
+        member: String,
+    },
+    Remove {
+        group: String,
+        member: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -135,8 +151,13 @@ enum TokenCmd {
 enum GrantCmd {
     List,
     /// Create or replace a grant from a JSON file ("-" for stdin).
-    Put { id: String, file: PathBuf },
-    Delete { id: String },
+    Put {
+        id: String,
+        file: PathBuf,
+    },
+    Delete {
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -153,9 +174,15 @@ enum FullCmd {
         #[arg(long, default_value_t = 3600)]
         duration: i64,
     },
-    Approve { id: String },
-    Reject { id: String },
-    Revoke { id: String },
+    Approve {
+        id: String,
+    },
+    Reject {
+        id: String,
+    },
+    Revoke {
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -284,7 +311,11 @@ impl Api {
     }
 
     async fn call(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Value {
-        self.raw(method, path, body).await.json().await.unwrap_or(Value::Null)
+        self.raw(method, path, body)
+            .await
+            .json()
+            .await
+            .unwrap_or(Value::Null)
     }
 
     async fn get(&self, path: &str) -> Value {
@@ -352,7 +383,10 @@ async fn main() {
                 .get_all("set-cookie")
                 .iter()
                 .filter_map(|v| v.to_str().ok())
-                .find_map(|c| c.strip_prefix("cjs_session=").map(|r| r.split(';').next().unwrap_or("").to_string()));
+                .find_map(|c| {
+                    c.strip_prefix("cjs_session=")
+                        .map(|r| r.split(';').next().unwrap_or("").to_string())
+                });
             let ok = resp.status().is_success();
             let v: Value = resp.json().await.unwrap_or(json!({}));
             if !ok {
@@ -366,7 +400,9 @@ async fn main() {
                 server: server.clone(),
                 cookie: cookie.unwrap_or_else(|| die("server did not set a session cookie")),
                 csrf: v["csrf"].as_str().unwrap_or_default().to_string(),
-                ca: ca.as_ref().map(|p| std::fs::canonicalize(p).unwrap_or_else(|e| die(format!("{}: {e}", p.display())))),
+                ca: ca.as_ref().map(|p| {
+                    std::fs::canonicalize(p).unwrap_or_else(|e| die(format!("{}: {e}", p.display())))
+                }),
             };
             if let Some(d) = path.parent() {
                 std::fs::create_dir_all(d).unwrap_or_else(|e| die(e));

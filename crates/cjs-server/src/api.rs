@@ -79,7 +79,10 @@ impl Auth {
             Ok(())
         } else {
             let names: Vec<_> = rs.iter().map(|r| r.as_str()).collect();
-            Err(ApiError::forbidden(format!("requires one of the roles {}", names.join(", "))))
+            Err(ApiError::forbidden(format!(
+                "requires one of the roles {}",
+                names.join(", ")
+            )))
         }
     }
 
@@ -139,7 +142,10 @@ impl FromRequestParts<Server> for Auth {
             sh.db.delete_web_session(&hash)?;
             return Err(ApiError::unauth("session expired"));
         }
-        let user = sh.db.user(&uid)?.ok_or_else(|| ApiError::unauth("session expired"))?;
+        let user = sh
+            .db
+            .user(&uid)?
+            .ok_or_else(|| ApiError::unauth("session expired"))?;
         if let Err(why) = user.usable(t) {
             sh.db.delete_web_session(&hash)?;
             return Err(ApiError::new(ErrorCode::Disabled, why));
@@ -184,46 +190,181 @@ fn session_cookie(token: &str, max_age: i64, secure: bool) -> HeaderValue {
 /// Documented routes: (method, path, required role, summary). Used to build
 /// the OpenAPI document; `tests::openapi_matches_routes` keeps it honest.
 pub const ROUTES: &[(&str, &str, &str, &str)] = &[
-    ("post", "/api/v1/login", "-", "Log in with name, password and TOTP code"),
+    (
+        "post",
+        "/api/v1/login",
+        "-",
+        "Log in with name, password and TOTP code",
+    ),
     ("post", "/api/v1/logout", "any", "End the current session"),
     ("get", "/api/v1/me", "any", "Current user and CSRF token"),
-    ("post", "/api/v1/me/password", "any", "Change own password (needs TOTP)"),
+    (
+        "post",
+        "/api/v1/me/password",
+        "any",
+        "Change own password (needs TOTP)",
+    ),
     ("get", "/api/v1/info", "any", "Server version and key fingerprint"),
     ("get", "/api/v1/users", "sysadmin", "List users"),
-    ("post", "/api/v1/users", "sysadmin", "Create a user (returns initial password and TOTP secret once)"),
-    ("patch", "/api/v1/users/{id}", "sysadmin", "Change status, roles, display name or expiry"),
-    ("post", "/api/v1/users/{id}/reset", "sysadmin", "Reset password and TOTP"),
-    ("post", "/api/v1/users/{id}/unlock", "sysadmin", "Clear a login lockout"),
-    ("get", "/api/v1/agents", "any", "List agents (own agents unless sysadmin)"),
-    ("patch", "/api/v1/agents/{id}", "sysadmin|owner", "Enable/disable an agent or set its expiry"),
-    ("delete", "/api/v1/agents/{id}", "sysadmin|owner", "Delete an agent"),
+    (
+        "post",
+        "/api/v1/users",
+        "sysadmin",
+        "Create a user (returns initial password and TOTP secret once)",
+    ),
+    (
+        "patch",
+        "/api/v1/users/{id}",
+        "sysadmin",
+        "Change status, roles, display name or expiry",
+    ),
+    (
+        "post",
+        "/api/v1/users/{id}/reset",
+        "sysadmin",
+        "Reset password and TOTP",
+    ),
+    (
+        "post",
+        "/api/v1/users/{id}/unlock",
+        "sysadmin",
+        "Clear a login lockout",
+    ),
+    (
+        "get",
+        "/api/v1/agents",
+        "any",
+        "List agents (own agents unless sysadmin)",
+    ),
+    (
+        "patch",
+        "/api/v1/agents/{id}",
+        "sysadmin|owner",
+        "Enable/disable an agent or set its expiry",
+    ),
+    (
+        "delete",
+        "/api/v1/agents/{id}",
+        "sysadmin|owner",
+        "Delete an agent",
+    ),
     ("get", "/api/v1/devices", "any", "List devices"),
-    ("patch", "/api/v1/devices/{id}", "sysadmin", "Enable or disable a device"),
+    (
+        "patch",
+        "/api/v1/devices/{id}",
+        "sysadmin",
+        "Enable or disable a device",
+    ),
     ("delete", "/api/v1/devices/{id}", "sysadmin", "Delete a device"),
     ("get", "/api/v1/groups", "any", "List groups"),
-    ("post", "/api/v1/groups", "sysadmin", "Create a group (kind user, agent or device)"),
+    (
+        "post",
+        "/api/v1/groups",
+        "sysadmin",
+        "Create a group (kind user, agent or device)",
+    ),
     ("delete", "/api/v1/groups/{id}", "sysadmin", "Delete a group"),
-    ("put", "/api/v1/groups/{id}/members/{member}", "sysadmin", "Add a member"),
-    ("delete", "/api/v1/groups/{id}/members/{member}", "sysadmin", "Remove a member"),
-    ("get", "/api/v1/tokens", "any", "List enrollment tokens (own unless sysadmin)"),
-    ("post", "/api/v1/tokens", "any", "Create an enrollment token (devices: sysadmin)"),
+    (
+        "put",
+        "/api/v1/groups/{id}/members/{member}",
+        "sysadmin",
+        "Add a member",
+    ),
+    (
+        "delete",
+        "/api/v1/groups/{id}/members/{member}",
+        "sysadmin",
+        "Remove a member",
+    ),
+    (
+        "get",
+        "/api/v1/tokens",
+        "any",
+        "List enrollment tokens (own unless sysadmin)",
+    ),
+    (
+        "post",
+        "/api/v1/tokens",
+        "any",
+        "Create an enrollment token (devices: sysadmin)",
+    ),
     ("get", "/api/v1/grants", "secadmin|auditor", "List grants"),
-    ("put", "/api/v1/grants/{id}", "secadmin", "Create or replace a grant"),
+    (
+        "put",
+        "/api/v1/grants/{id}",
+        "secadmin",
+        "Create or replace a grant",
+    ),
     ("delete", "/api/v1/grants/{id}", "secadmin", "Delete a grant"),
     ("get", "/api/v1/full-access", "any", "List full-access requests"),
-    ("post", "/api/v1/full-access", "any", "Request full access for an agent on a device"),
-    ("post", "/api/v1/full-access/{id}/approve", "secadmin", "Approve (two-person rule)"),
-    ("post", "/api/v1/full-access/{id}/reject", "secadmin", "Reject a pending request"),
-    ("post", "/api/v1/full-access/{id}/revoke", "secadmin", "Revoke an approval"),
-    ("get", "/api/v1/live/connections", "secadmin|auditor", "Connected agents and devices"),
+    (
+        "post",
+        "/api/v1/full-access",
+        "any",
+        "Request full access for an agent on a device",
+    ),
+    (
+        "post",
+        "/api/v1/full-access/{id}/approve",
+        "secadmin",
+        "Approve (two-person rule)",
+    ),
+    (
+        "post",
+        "/api/v1/full-access/{id}/reject",
+        "secadmin",
+        "Reject a pending request",
+    ),
+    (
+        "post",
+        "/api/v1/full-access/{id}/revoke",
+        "secadmin",
+        "Revoke an approval",
+    ),
+    (
+        "get",
+        "/api/v1/live/connections",
+        "secadmin|auditor",
+        "Connected agents and devices",
+    ),
     ("get", "/api/v1/live/streams", "secadmin|auditor", "Open sessions"),
-    ("post", "/api/v1/live/sessions/{session}/kill", "secadmin", "Terminate a session"),
-    ("post", "/api/v1/live/connections/{id}/kick", "secadmin", "Disconnect a client"),
+    (
+        "post",
+        "/api/v1/live/sessions/{session}/kill",
+        "secadmin",
+        "Terminate a session",
+    ),
+    (
+        "post",
+        "/api/v1/live/connections/{id}/kick",
+        "secadmin",
+        "Disconnect a client",
+    ),
     ("get", "/api/v1/audit", "auditor", "Query the audit log"),
-    ("get", "/api/v1/audit/verify", "auditor", "Verify the hash chain and signed checkpoints"),
-    ("get", "/api/v1/audit/export", "auditor", "Export events and checkpoints (JSON lines)"),
-    ("post", "/api/v1/audit/checkpoint", "auditor", "Sign the current head now"),
-    ("get", "/api/v1/recordings/{session}", "auditor", "Download a terminal recording (asciicast v2)"),
+    (
+        "get",
+        "/api/v1/audit/verify",
+        "auditor",
+        "Verify the hash chain and signed checkpoints",
+    ),
+    (
+        "get",
+        "/api/v1/audit/export",
+        "auditor",
+        "Export events and checkpoints (JSON lines)",
+    ),
+    (
+        "post",
+        "/api/v1/audit/checkpoint",
+        "auditor",
+        "Sign the current head now",
+    ),
+    (
+        "get",
+        "/api/v1/recordings/{session}",
+        "auditor",
+        "Download a terminal recording (asciicast v2)",
+    ),
     ("get", "/api/v1/openapi.json", "-", "This document"),
 ];
 
@@ -239,12 +380,21 @@ pub fn router(srv: Server) -> Router {
         .route("/api/v1/users/{id}/reset", post(reset_user))
         .route("/api/v1/users/{id}/unlock", post(unlock_user))
         .route("/api/v1/agents", get(list_agents))
-        .route("/api/v1/agents/{id}", axum::routing::patch(patch_agent).delete(delete_agent))
+        .route(
+            "/api/v1/agents/{id}",
+            axum::routing::patch(patch_agent).delete(delete_agent),
+        )
         .route("/api/v1/devices", get(list_devices))
-        .route("/api/v1/devices/{id}", axum::routing::patch(patch_device).delete(delete_device))
+        .route(
+            "/api/v1/devices/{id}",
+            axum::routing::patch(patch_device).delete(delete_device),
+        )
         .route("/api/v1/groups", get(list_groups).post(create_group))
         .route("/api/v1/groups/{id}", delete(delete_group))
-        .route("/api/v1/groups/{id}/members/{member}", put(add_member).delete(remove_member))
+        .route(
+            "/api/v1/groups/{id}/members/{member}",
+            put(add_member).delete(remove_member),
+        )
         .route("/api/v1/tokens", get(list_tokens).post(create_token))
         .route("/api/v1/grants", get(list_grants))
         .route("/api/v1/grants/{id}", put(put_grant).delete(delete_grant))
@@ -303,7 +453,10 @@ async fn login(
                     .ip(ip.clone())
                     .data(json!({"user": req.name, "reason": "too many failures from this address"})),
             );
-            return Err(ApiError::new(ErrorCode::LimitExceeded, "too many failed logins; try again later"));
+            return Err(ApiError::new(
+                ErrorCode::LimitExceeded,
+                "too many failed logins; try again later",
+            ));
         }
     }
     let user = match accounts::login(&sh.db, &sh.audit, &req.name, &req.password, &req.totp, ip.clone()) {
@@ -350,7 +503,11 @@ struct PasswordReq {
     totp: String,
 }
 
-async fn change_password(State(srv): State<Server>, auth: Auth, Body(req): Body<PasswordReq>) -> R<Json<Value>> {
+async fn change_password(
+    State(srv): State<Server>,
+    auth: Auth,
+    Body(req): Body<PasswordReq>,
+) -> R<Json<Value>> {
     let sh = &srv.shared;
     let mut u = auth.user.clone();
     if !accounts::verify_password(&req.old, &u.password_hash) {
@@ -440,7 +597,10 @@ struct PatchUser {
 }
 
 fn load_user(srv: &Server, id: &str) -> R<User> {
-    srv.shared.db.user(id)?.ok_or_else(|| ApiError::not_found("no such user"))
+    srv.shared
+        .db
+        .user(id)?
+        .ok_or_else(|| ApiError::not_found("no such user"))
 }
 
 async fn patch_user(
@@ -495,7 +655,11 @@ async fn reset_user(State(srv): State<Server>, auth: Auth, Path(id): Path<String
     }
     let password = accounts::random_password();
     let secret = accounts::new_totp_secret();
-    sh.audit(auth.event("admin.user.reset", &u.id).highlight(true).data(json!({"name": u.name})))?;
+    sh.audit(
+        auth.event("admin.user.reset", &u.id)
+            .highlight(true)
+            .data(json!({"name": u.name})),
+    )?;
     u.password_hash = accounts::hash_password(&password)?;
     u.totp_secret = secret.clone();
     u.last_totp_step = 0;
@@ -551,7 +715,10 @@ async fn patch_agent(
     Body(req): Body<PatchStatus>,
 ) -> R<Json<Value>> {
     let sh = &srv.shared;
-    let a = sh.db.agent(&id)?.ok_or_else(|| ApiError::not_found("no such agent"))?;
+    let a = sh
+        .db
+        .agent(&id)?
+        .ok_or_else(|| ApiError::not_found("no such agent"))?;
     let is_owner = a.owner_id == auth.user.id;
     if !auth.user.has(Role::Sysadmin) {
         // Owners may only switch their own agents off.
@@ -586,11 +753,18 @@ async fn patch_agent(
 
 async fn delete_agent(State(srv): State<Server>, auth: Auth, Path(id): Path<String>) -> R<Json<Value>> {
     let sh = &srv.shared;
-    let a = sh.db.agent(&id)?.ok_or_else(|| ApiError::not_found("no such agent"))?;
+    let a = sh
+        .db
+        .agent(&id)?
+        .ok_or_else(|| ApiError::not_found("no such agent"))?;
     if !auth.user.has(Role::Sysadmin) && a.owner_id != auth.user.id {
         return Err(ApiError::forbidden("not your agent"));
     }
-    sh.audit(auth.event("admin.agent.delete", &a.id).highlight(true).data(json!({"name": a.name})))?;
+    sh.audit(
+        auth.event("admin.agent.delete", &a.id)
+            .highlight(true)
+            .data(json!({"name": a.name})),
+    )?;
     sh.db.delete_agent(&a.id)?;
     srv.enforce();
     Ok(Json(json!({"ok": true})))
@@ -619,7 +793,10 @@ async fn patch_device(
 ) -> R<Json<Value>> {
     auth.require(Role::Sysadmin)?;
     let sh = &srv.shared;
-    let d = sh.db.device(&id)?.ok_or_else(|| ApiError::not_found("no such device"))?;
+    let d = sh
+        .db
+        .device(&id)?
+        .ok_or_else(|| ApiError::not_found("no such device"))?;
     let status = req.status.ok_or_else(|| ApiError::bad("status is required"))?;
     if status != "active" && status != "disabled" {
         return Err(ApiError::bad("status must be active or disabled"));
@@ -637,8 +814,15 @@ async fn patch_device(
 async fn delete_device(State(srv): State<Server>, auth: Auth, Path(id): Path<String>) -> R<Json<Value>> {
     auth.require(Role::Sysadmin)?;
     let sh = &srv.shared;
-    let d = sh.db.device(&id)?.ok_or_else(|| ApiError::not_found("no such device"))?;
-    sh.audit(auth.event("admin.device.delete", &d.id).highlight(true).data(json!({"name": d.name})))?;
+    let d = sh
+        .db
+        .device(&id)?
+        .ok_or_else(|| ApiError::not_found("no such device"))?;
+    sh.audit(
+        auth.event("admin.device.delete", &d.id)
+            .highlight(true)
+            .data(json!({"name": d.name})),
+    )?;
     sh.db.delete_device(&d.id)?;
     srv.enforce();
     Ok(Json(json!({"ok": true})))
@@ -682,20 +866,29 @@ async fn create_group(State(srv): State<Server>, auth: Auth, Body(req): Body<Cre
         members: vec![],
         created_at: now(),
     };
-    sh.audit(auth.event("admin.group.create", &g.id).data(json!({"name": g.name, "kind": g.kind})))?;
+    sh.audit(
+        auth.event("admin.group.create", &g.id)
+            .data(json!({"name": g.name, "kind": g.kind})),
+    )?;
     sh.db.insert_group(&g)?;
     Ok(Json(json!(g)))
 }
 
 fn load_group(srv: &Server, id: &str) -> R<Group> {
-    srv.shared.db.group(id)?.ok_or_else(|| ApiError::not_found("no such group"))
+    srv.shared
+        .db
+        .group(id)?
+        .ok_or_else(|| ApiError::not_found("no such group"))
 }
 
 async fn delete_group(State(srv): State<Server>, auth: Auth, Path(id): Path<String>) -> R<Json<Value>> {
     auth.require(Role::Sysadmin)?;
     let g = load_group(&srv, &id)?;
-    srv.shared
-        .audit(auth.event("admin.group.delete", &g.id).highlight(true).data(json!({"name": g.name})))?;
+    srv.shared.audit(
+        auth.event("admin.group.delete", &g.id)
+            .highlight(true)
+            .data(json!({"name": g.name})),
+    )?;
     srv.shared.db.delete_group(&g.id)?;
     srv.enforce();
     Ok(Json(json!({"ok": true})))
@@ -712,16 +905,27 @@ async fn membership(srv: &Server, auth: &Auth, id: &str, member: &str, present: 
     }
     .ok_or_else(|| ApiError::not_found(format!("no such {}", g.kind)))?;
     sh.audit(
-        auth.event(if present { "admin.group.add" } else { "admin.group.remove" }, &g.id)
-            .highlight(true)
-            .data(json!({"group": g.name, "member": member_id})),
+        auth.event(
+            if present {
+                "admin.group.add"
+            } else {
+                "admin.group.remove"
+            },
+            &g.id,
+        )
+        .highlight(true)
+        .data(json!({"group": g.name, "member": member_id})),
     )?;
     sh.db.set_membership(&g.id, &member_id, present)?;
     srv.enforce();
     Ok(Json(json!(load_group(srv, &g.id)?)))
 }
 
-async fn add_member(State(srv): State<Server>, auth: Auth, Path((id, member)): Path<(String, String)>) -> R<Json<Value>> {
+async fn add_member(
+    State(srv): State<Server>,
+    auth: Auth,
+    Path((id, member)): Path<(String, String)>,
+) -> R<Json<Value>> {
     membership(&srv, &auth, &id, &member, true).await
 }
 
@@ -775,14 +979,19 @@ async fn create_token(State(srv): State<Server>, auth: Auth, Body(req): Body<Cre
         }
         ClientRole::Agent => {
             let o = req.owner.clone().unwrap_or_else(|| auth.user.id.clone());
-            let o = srv.shared.db.user(&o)?.ok_or_else(|| ApiError::not_found("no such owner"))?;
+            let o = srv
+                .shared
+                .db
+                .user(&o)?
+                .ok_or_else(|| ApiError::not_found("no such owner"))?;
             if o.id != auth.user.id {
                 auth.require(Role::Sysadmin)?;
             }
             Some(o.id)
         }
     };
-    let (row, token) = srv.create_enroll_token(kind, &req.name, owner.as_deref(), &auth.user.id, req.ttl_secs)?;
+    let (row, token) =
+        srv.create_enroll_token(kind, &req.name, owner.as_deref(), &auth.user.id, req.ttl_secs)?;
     Ok(Json(json!({"token": token, "info": row})))
 }
 
@@ -872,9 +1081,16 @@ async fn put_grant(
     let sh = &srv.shared;
     let existed = sh.db.grant(&g.id)?.is_some();
     sh.audit(
-        auth.event(if existed { "admin.grant.update" } else { "admin.grant.create" }, &g.id)
-            .highlight(true)
-            .data(serde_json::to_value(&g).unwrap_or_default()),
+        auth.event(
+            if existed {
+                "admin.grant.update"
+            } else {
+                "admin.grant.create"
+            },
+            &g.id,
+        )
+        .highlight(true)
+        .data(serde_json::to_value(&g).unwrap_or_default()),
     )?;
     sh.db.upsert_grant(&g, &auth.user.id)?;
     srv.enforce();
@@ -926,8 +1142,14 @@ struct FullReq {
 
 async fn request_full(State(srv): State<Server>, auth: Auth, Body(req): Body<FullReq>) -> R<Json<Value>> {
     let sh = &srv.shared;
-    let a = sh.db.agent(&req.agent)?.ok_or_else(|| ApiError::not_found("no such agent"))?;
-    let d = sh.db.device(&req.device)?.ok_or_else(|| ApiError::not_found("no such device"))?;
+    let a = sh
+        .db
+        .agent(&req.agent)?
+        .ok_or_else(|| ApiError::not_found("no such agent"))?;
+    let d = sh
+        .db
+        .device(&req.device)?
+        .ok_or_else(|| ApiError::not_found("no such device"))?;
     if a.owner_id != auth.user.id {
         auth.require(Role::Secadmin)?;
     }
@@ -995,7 +1217,10 @@ async fn decide_full(srv: &Server, auth: &Auth, id: &str, to: ApprovalStatus) ->
         _ => false,
     };
     if !ok {
-        return Err(ApiError::new(ErrorCode::Conflict, format!("request is {}", f.status.as_str())));
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            format!("request is {}", f.status.as_str()),
+        ));
     }
     f.status = to;
     f.decided_at = Some(now());
@@ -1041,9 +1266,16 @@ async fn kill_session(State(srv): State<Server>, auth: Auth, Path(session): Path
     if streams.is_empty() {
         return Err(ApiError::not_found("no such live session"));
     }
-    sh.audit(auth.event("admin.session.kill", &session).highlight(true).session(session.clone()))?;
+    sh.audit(
+        auth.event("admin.session.kill", &session)
+            .highlight(true)
+            .session(session.clone()),
+    )?;
     for s in streams {
-        s.terminate(cjs_proto::ProtoError::new(ErrorCode::Cancelled, "terminated by a security administrator"));
+        s.terminate(cjs_proto::ProtoError::new(
+            ErrorCode::Cancelled,
+            "terminated by a security administrator",
+        ));
     }
     Ok(Json(json!({"ok": true})))
 }
@@ -1051,14 +1283,19 @@ async fn kill_session(State(srv): State<Server>, auth: Auth, Path(session): Path
 async fn kick_connection(State(srv): State<Server>, auth: Auth, Path(id): Path<String>) -> R<Json<Value>> {
     auth.require(Role::Secadmin)?;
     let sh = &srv.shared;
-    let c = sh.reg.conn(&id).ok_or_else(|| ApiError::not_found("no such connection"))?;
+    let c = sh
+        .reg
+        .conn(&id)
+        .ok_or_else(|| ApiError::not_found("no such connection"))?;
     sh.audit(
         auth.event("admin.connection.kick", &c.principal)
             .highlight(true)
             .data(json!({"connection": c.id})),
     )?;
-    c.session
-        .close(cjs_proto::ProtoError::new(ErrorCode::Cancelled, "disconnected by a security administrator"));
+    c.session.close(cjs_proto::ProtoError::new(
+        ErrorCode::Cancelled,
+        "disconnected by a security administrator",
+    ));
     Ok(Json(json!({"ok": true})))
 }
 
@@ -1066,7 +1303,11 @@ async fn kick_connection(State(srv): State<Server>, auth: Auth, Path(id): Path<S
 // Audit
 // ---------------------------------------------------------------------------
 
-async fn audit_query(State(srv): State<Server>, auth: Auth, Query(q): Query<cjs_audit::Query>) -> R<Json<Value>> {
+async fn audit_query(
+    State(srv): State<Server>,
+    auth: Auth,
+    Query(q): Query<cjs_audit::Query>,
+) -> R<Json<Value>> {
     auth.require(Role::Auditor)?;
     let sh = &srv.shared;
     sh.audit(auth.event("audit.query", "audit").data(json!({
@@ -1079,7 +1320,10 @@ async fn audit_verify(State(srv): State<Server>, auth: Auth) -> R<Json<Value>> {
     auth.require(Role::Auditor)?;
     let sh = &srv.shared;
     let r = sh.audit.verify(None)?;
-    sh.audit(auth.event("audit.verify", "audit").data(json!({"ok": r.ok, "events": r.events})))?;
+    sh.audit(
+        auth.event("audit.verify", "audit")
+            .data(json!({"ok": r.ok, "events": r.events})),
+    )?;
     Ok(Json(json!(r)))
 }
 
@@ -1094,7 +1338,10 @@ async fn audit_export(State(srv): State<Server>, auth: Auth) -> R<Response> {
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "application/x-ndjson"),
-            (header::CONTENT_DISPOSITION, "attachment; filename=\"cjs-audit.jsonl\""),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"cjs-audit.jsonl\"",
+            ),
         ],
         buf,
     )
@@ -1116,7 +1363,10 @@ async fn recording(State(srv): State<Server>, auth: Auth, Path(session): Path<St
     let sh = &srv.shared;
     let path = sh.cfg.recordings_dir.join(format!("{session}.cast"));
     let data = std::fs::read(&path).map_err(|_| ApiError::not_found("no recording for this session"))?;
-    sh.audit(auth.event("audit.recording.view", &session).session(session.clone()))?;
+    sh.audit(
+        auth.event("audit.recording.view", &session)
+            .session(session.clone()),
+    )?;
     Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/x-asciicast")],

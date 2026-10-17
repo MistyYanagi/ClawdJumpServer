@@ -310,6 +310,26 @@ impl AuditLog {
         Ok(())
     }
 
+    /// Sequence number of the newest event (0 when empty).
+    pub fn head_seq(&self) -> Result<u64, AuditError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let seq: Option<i64> = conn
+            .query_row("SELECT MAX(seq) FROM events", [], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(seq.unwrap_or(0) as u64)
+    }
+
+    /// Sequence number of the newest signed checkpoint (0 when none).
+    pub fn last_checkpoint(&self) -> Result<u64, AuditError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let seq: Option<i64> = conn
+            .query_row("SELECT MAX(seq) FROM checkpoints", [], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(seq.unwrap_or(0) as u64)
+    }
+
     /// Sign the current head now (e.g. at shutdown or before export).
     pub fn checkpoint(&self) -> Result<Option<u64>, AuditError> {
         if self.fail.load(Ordering::SeqCst) {

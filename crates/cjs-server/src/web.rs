@@ -24,8 +24,14 @@ pub async fn security_headers(req: Request, next: Next) -> Response {
     h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
     h.insert("x-frame-options", HeaderValue::from_static("DENY"));
     h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
-    h.insert("cross-origin-opener-policy", HeaderValue::from_static("same-origin"));
-    h.insert("cross-origin-resource-policy", HeaderValue::from_static("same-origin"));
+    h.insert(
+        "cross-origin-opener-policy",
+        HeaderValue::from_static("same-origin"),
+    );
+    h.insert(
+        "cross-origin-resource-policy",
+        HeaderValue::from_static("same-origin"),
+    );
     h.insert(
         "permissions-policy",
         HeaderValue::from_static("camera=(), microphone=(), geolocation=(), clipboard-read=()"),
