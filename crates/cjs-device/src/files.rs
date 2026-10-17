@@ -166,8 +166,11 @@ pub(crate) async fn put(
     }
     #[cfg(not(unix))]
     let _ = mode;
+    drop(f);
+    // The write handle is write-only; checksum through a fresh jailed read.
+    let mut rf = tokio::fs::File::from_std(jail.open_read(path)?);
     let mut h = Sha256::new();
-    hash_prefix(&mut f, *size, &mut h).await?;
+    hash_prefix(&mut rf, *size, &mut h).await?;
     write_msg(
         s,
         &FileMsg::Done {
