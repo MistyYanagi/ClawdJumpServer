@@ -454,7 +454,7 @@ async fn c07_full_access_two_person_rule() {
     let a = env.agent().await;
     let outside = OpenRequest::FileGet {
         device: "dev1".into(),
-        path: "/etc/hostname".into(),
+        path: "/etc/hosts".into(),
         offset: 0,
     };
     assert_eq!(
