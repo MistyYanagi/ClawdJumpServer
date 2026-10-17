@@ -210,15 +210,22 @@ async fn resume_under_chaos(mode: TransportMode) {
     let resumes = conn.resumes.clone();
     let (h, _in, _t) = cjs_mux::spawn(conn.io, cjs_mux::Mode::Client);
     let h2 = h.clone();
+    // Keep data flowing until every cut has happened, so the cuts always
+    // hit live transfers (fast machines finish a fixed workload early).
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
     let work = tokio::spawn(async move {
-        for i in 0..4u8 {
+        let mut i = 0u8;
+        while !stop2.load(std::sync::atomic::Ordering::SeqCst) || i < 4 {
             echo_roundtrip(&h2, 2_000_000, i).await;
+            i = i.wrapping_add(1);
         }
     });
     for _ in 0..4 {
         tokio::time::sleep(Duration::from_millis(250)).await;
         chaos.cut();
     }
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
     tokio::time::timeout(Duration::from_secs(60), work)
         .await
         .unwrap()

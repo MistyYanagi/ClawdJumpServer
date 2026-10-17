@@ -446,7 +446,10 @@ impl HttpLink {
                 .timeout(crate::LONG_POLL + Duration::from_secs(15));
             match self.call(req).await {
                 Ok(batch) => {
-                    lost_at = None;
+                    // A recovered download link counts as a resume too.
+                    if lost_at.take().is_some() {
+                        self.resumes.send_modify(|n| *n += 1);
+                    }
                     backoff = Duration::from_millis(200);
                     let mut res = self.core.ack(batch.ack);
                     for (seq, data) in &batch.msgs {
