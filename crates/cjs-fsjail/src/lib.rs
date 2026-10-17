@@ -108,6 +108,23 @@ fn is_abs(p: &str) -> bool {
     p.starts_with('/') || p.starts_with('\\') || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
 }
 
+/// Comparable form of a path component. Windows drive prefixes compare
+/// equal whether written `C:` or verbatim `\\?\C:` (what `canonicalize`
+/// returns).
+fn component_key(c: &Component<'_>) -> String {
+    #[cfg(windows)]
+    if let Component::Prefix(p) = c {
+        use std::path::Prefix;
+        match p.kind() {
+            Prefix::Disk(d) | Prefix::VerbatimDisk(d) => {
+                return format!("{}:", (d as char).to_ascii_uppercase())
+            }
+            _ => {}
+        }
+    }
+    c.as_os_str().to_string_lossy().into_owned()
+}
+
 /// Strip `root` from `full` (both already normalised), respecting
 /// case-insensitive file systems.
 fn strip_root(full: &Path, root: &Path) -> Option<PathBuf> {
@@ -117,7 +134,7 @@ fn strip_root(full: &Path, root: &Path) -> Option<PathBuf> {
         return None;
     }
     for (a, b) in fc.iter().zip(rc.iter()) {
-        let (a, b) = (a.as_os_str().to_string_lossy(), b.as_os_str().to_string_lossy());
+        let (a, b) = (component_key(a), component_key(b));
         let eq = if case_insensitive_fs() {
             a.eq_ignore_ascii_case(&b)
         } else {
