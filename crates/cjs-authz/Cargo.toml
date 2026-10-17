@@ -1,6 +1,20 @@
 [package]
 name = "cjs-authz"
-version = "0.1.0"
-edition = "2024"
+description = "4A policy model and decision point, network rules, capability tokens"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
+cjs-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+ipnet.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+
+[lints]
+workspace = true

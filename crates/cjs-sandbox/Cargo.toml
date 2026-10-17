@@ -1,6 +1,27 @@
 [package]
 name = "cjs-sandbox"
-version = "0.1.0"
-edition = "2024"
+description = "OS sandboxes for agent shells: Landlock (Linux), sandbox-exec (macOS), AppContainer (Windows)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock.workspace = true
+rlimit.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rlimit.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Isolation", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_Storage_FileSystem", "Win32_System_Console"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# The only crate allowed to use `unsafe` (Windows FFI).
+[lints.rust]
+unsafe_code = "allow"

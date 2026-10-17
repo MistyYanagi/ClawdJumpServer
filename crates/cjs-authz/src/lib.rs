@@ -1,14 +1,16 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Authorization for ClawdJumpServer.
+//!
+//! * [`model`]: roles, grants, full-access requests.
+//! * [`net`]: host/port rules for forwarding and egress, SSRF guard.
+//! * [`pdp`]: the policy decision point (default deny).
+//! * [`capability`]: Ed25519-signed capability tokens that devices verify
+//!   independently of the server.
+#![forbid(unsafe_code)]
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod capability;
+pub mod model;
+pub mod net;
+pub mod pdp;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use model::*;
+pub use pdp::{decide, AccessRequest, Decision};
