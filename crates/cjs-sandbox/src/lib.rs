@@ -169,11 +169,20 @@ pub fn probe() -> Result<String, SandboxError> {
 mod tests {
     use super::*;
 
+    /// An absolute path on the current platform.
+    fn abs(p: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:{}", p.replace('/', "\\")))
+        } else {
+            PathBuf::from(p)
+        }
+    }
+
     #[test]
     fn helper_args_roundtrip() {
         let p = Policy {
-            write_roots: vec![PathBuf::from("/work")],
-            temp_dir: Some(PathBuf::from("/tmp/x")),
+            write_roots: vec![abs("/work")],
+            temp_dir: Some(abs("/tmp/x")),
         };
         let argv = vec!["sh".to_string(), "-c".into(), "echo hi".into()];
         #[cfg(not(target_os = "macos"))]
@@ -181,13 +190,16 @@ mod tests {
             let w = wrap(Path::new("/bin/dev"), &p, &argv).unwrap();
             assert_eq!(w[1], HELPER_ARG);
             let parsed = parse_helper_args(&w[2..]).unwrap();
-            assert_eq!(
-                parsed.write,
-                vec![PathBuf::from("/work"), PathBuf::from("/tmp/x")]
-            );
+            assert_eq!(parsed.write, vec![abs("/work"), abs("/tmp/x")]);
             assert_eq!(parsed.argv, argv);
         }
         let _ = (p, argv);
+        // Relative roots are refused on every platform.
+        let rel = Policy {
+            write_roots: vec![PathBuf::from("work")],
+            temp_dir: None,
+        };
+        assert!(wrap(Path::new("/bin/dev"), &rel, &["sh".to_string()]).is_err());
         assert!(parse_helper_args(&["--write".into()]).is_err());
         assert!(parse_helper_args(&["--".into()]).is_err());
     }
