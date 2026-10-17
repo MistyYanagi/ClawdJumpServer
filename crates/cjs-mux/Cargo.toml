@@ -1,0 +1,17 @@
+[package]
+name = "cjs-mux"
+description = "Stream multiplexer with credit-based flow control for ClawdJumpServer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cjs-proto.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
