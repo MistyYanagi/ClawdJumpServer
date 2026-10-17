@@ -76,6 +76,9 @@ enum Cmd {
         /// Create missing remote directories.
         #[arg(long)]
         mkdirs: bool,
+        /// Copy a directory tree (symlinks are skipped, never followed).
+        #[arg(short = 'r', long)]
+        recursive: bool,
         src: String,
         dst: String,
     },
@@ -319,11 +322,43 @@ async fn run(cli: Cli) -> Result<i32, ProtoError> {
         Cmd::Cp {
             resume,
             mkdirs,
+            recursive,
             src,
             dst,
         } => {
             let op = opener().await?;
             let dev = |d: Option<&str>| d.map(String::from).map(Ok).unwrap_or_else(device);
+            if *recursive {
+                let t = match (split_remote(src), split_remote(dst)) {
+                    (Some((d, rp)), None) => {
+                        ops::download_tree(&op, &dev(d)?, rp, std::path::Path::new(dst), *resume).await?
+                    }
+                    (None, Some((d, rp))) => {
+                        ops::upload_tree(&op, &dev(d)?, std::path::Path::new(src), rp, *resume).await?
+                    }
+                    _ => return Err(bad("exactly one of SRC and DST must be remote (device:path)")),
+                };
+                if cli.json {
+                    println!("{}", serde_json::to_string(&t).unwrap_or_default());
+                } else {
+                    eprintln!(
+                        "{} files, {} directories, {} bytes{}",
+                        t.files.len(),
+                        t.dirs,
+                        t.bytes,
+                        if t.skipped.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                "; skipped {} (symlinks/special): {}",
+                                t.skipped.len(),
+                                t.skipped.join(", ")
+                            )
+                        }
+                    );
+                }
+                return Ok(0);
+            }
             let t = match (split_remote(src), split_remote(dst)) {
                 (Some((d, rp)), None) => {
                     ops::download(&op, &dev(d)?, rp, std::path::Path::new(dst), *resume).await?

@@ -1,4 +1,5 @@
-//! Local proxy: SOCKS5 (CONNECT, no auth) and HTTP CONNECT on one port.
+//! Local proxy: SOCKS5 (CONNECT, no auth), HTTP CONNECT and plain HTTP
+//! forward proxying (`GET http://host/path`) on one port.
 //! Every connection becomes an `Egress` stream, decided and audited by the
 //! server (optionally exiting through a device).
 use std::time::Duration;
@@ -17,13 +18,17 @@ pub async fn run(op: Opener, bind: &str, via: Option<String>) -> Result<(), Prot
     let l = TcpListener::bind(bind)
         .await
         .map_err(|e| ProtoError::new(ErrorCode::Io, format!("listen {bind}: {e}")))?;
+    let addr = l.local_addr().map_err(ioe)?;
     eprintln!(
-        "proxy listening on {} (SOCKS5 and HTTP CONNECT){}",
-        l.local_addr().map_err(ioe)?,
+        "proxy listening on {addr} (SOCKS5, HTTP CONNECT and HTTP forward){}",
         via.as_ref()
             .map(|v| format!(", exiting via {v}"))
             .unwrap_or_default()
     );
+    // Lines for `eval "$(cjs proxy)"`; diagnostics go to stderr.
+    println!("{}", export_lines(&addr.to_string()));
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
     loop {
         let (tcp, peer) = l.accept().await.map_err(ioe)?;
         let op = op.clone();
@@ -34,6 +39,21 @@ pub async fn run(op: Opener, bind: &str, via: Option<String>) -> Result<(), Prot
             }
         });
     }
+}
+
+/// Shell `export` lines pointing common tools at the proxy.
+pub fn export_lines(addr: &str) -> String {
+    let http = format!("http://{addr}");
+    let mut out = String::new();
+    for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+        out.push_str(&format!("export {k}={http}\n"));
+    }
+    for k in ["ALL_PROXY", "all_proxy"] {
+        out.push_str(&format!("export {k}=socks5h://{addr}\n"));
+    }
+    out.push_str("export NO_PROXY=localhost,127.0.0.1,::1\n");
+    out.push_str("export no_proxy=localhost,127.0.0.1,::1");
+    out
 }
 
 async fn handle(op: Opener, tcp: TcpStream, via: Option<String>) -> Result<(), ProtoError> {
@@ -113,44 +133,76 @@ async fn socks5(op: Opener, mut tcp: TcpStream, via: Option<String>) -> Result<(
     }
 }
 
+const MAX_HEAD: usize = 16 * 1024;
+
 async fn http_connect(op: Opener, tcp: TcpStream, via: Option<String>) -> Result<(), ProtoError> {
     let mut r = BufReader::new(tcp);
     let mut line = String::new();
     r.read_line(&mut line).await.map_err(ioe)?;
-    // Headers (ignored, bounded).
+    let mut headers = Vec::new();
     let mut total = line.len();
     loop {
         let mut h = String::new();
         let n = r.read_line(&mut h).await.map_err(ioe)?;
         total += n;
-        if n == 0 || h == "\r\n" || h == "\n" || total > 16 * 1024 {
+        if total > MAX_HEAD {
+            let mut tcp = r.into_inner();
+            let _ = tcp
+                .write_all(&error_response(
+                    "431 Request Header Fields Too Large",
+                    "headers too large",
+                ))
+                .await;
+            return Err(ProtoError::new(
+                ErrorCode::BadRequest,
+                "request headers too large",
+            ));
+        }
+        if n == 0 || h == "\r\n" || h == "\n" {
             break;
         }
+        headers.push(h);
     }
     let mut parts = line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let target = parts.next().unwrap_or("");
+    let method = parts.next().unwrap_or("").to_string();
+    let target = parts.next().unwrap_or("").to_string();
+    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
     // Bytes the client sent early (after the headers) must not be lost.
     let early = r.buffer().to_vec();
     let mut tcp = r.into_inner();
-    if !method.eq_ignore_ascii_case("CONNECT") {
-        let _ = tcp
-            .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            .await;
-        return Err(ProtoError::new(
-            ErrorCode::Unsupported,
-            "only CONNECT is supported",
-        ));
-    }
-    let (host, port) = target
-        .rsplit_once(':')
-        .and_then(|(h, p)| p.parse::<u16>().ok().map(|p| (h.to_string(), p)))
-        .ok_or_else(|| ProtoError::new(ErrorCode::BadRequest, "bad CONNECT target"))?;
+    let (host, port, head) = if method.eq_ignore_ascii_case("CONNECT") {
+        match parse_authority(&target, None) {
+            Some((h, p)) => (h, p, None),
+            None => {
+                let _ = tcp
+                    .write_all(&error_response("400 Bad Request", "bad CONNECT target"))
+                    .await;
+                return Err(ProtoError::new(ErrorCode::BadRequest, "bad CONNECT target"));
+            }
+        }
+    } else {
+        match forward_head(&method, &target, &version, &headers) {
+            Some(v) => (v.0, v.1, Some(v.2)),
+            None => {
+                let _ = tcp
+                    .write_all(&error_response(
+                        "400 Bad Request",
+                        "expected CONNECT or an absolute http:// URL (use CONNECT for https)",
+                    ))
+                    .await;
+                return Err(ProtoError::new(ErrorCode::BadRequest, "bad proxy request"));
+            }
+        }
+    };
     match op.open(&OpenRequest::Egress { host, port, via }).await {
         Ok((mut s, _)) => {
-            tcp.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .await
-                .map_err(ioe)?;
+            match head {
+                None => tcp
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                    .map_err(ioe)?,
+                Some(h) => s.write_all(h.as_bytes()).await.map_err(ioe)?,
+            }
             if !early.is_empty() {
                 s.write_all(&early).await.map_err(ioe)?;
             }
@@ -163,17 +215,134 @@ async fn http_connect(op: Opener, tcp: TcpStream, via: Option<String>) -> Result
             } else {
                 "502 Bad Gateway"
             };
-            let body = format!("{e}\n");
-            let _ = tcp
-                .write_all(
-                    format!(
-                        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                )
-                .await;
+            let _ = tcp.write_all(&error_response(status, &e.to_string())).await;
             Err(e)
         }
+    }
+}
+
+fn error_response(status: &str, msg: &str) -> Vec<u8> {
+    let body = format!("{msg}\n");
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+/// `host:port`, `[v6]:port`, or (with a default port) a bare host.
+fn parse_authority(a: &str, default_port: Option<u16>) -> Option<(String, u16)> {
+    if a.is_empty() || a.contains(['@', '/', ' ']) {
+        return None;
+    }
+    if let Some(rest) = a.strip_prefix('[') {
+        let (h, tail) = rest.split_once(']')?;
+        let port = match tail.strip_prefix(':') {
+            Some(p) => p.parse().ok()?,
+            None if tail.is_empty() => default_port?,
+            None => return None,
+        };
+        return Some((format!("[{h}]"), port));
+    }
+    match a.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && !h.contains(':') => Some((h.to_string(), p.parse().ok()?)),
+        Some(_) => None,
+        None => Some((a.to_string(), default_port?)),
+    }
+}
+
+/// For a forward-proxy request (`GET http://host/path HTTP/1.1`) returns the
+/// target and the request head rewritten to origin form. One request per
+/// connection: `Connection: close` is forced so a client cannot reuse the
+/// tunnel for a different host.
+fn forward_head(
+    method: &str,
+    target: &str,
+    version: &str,
+    headers: &[String],
+) -> Option<(String, u16, String)> {
+    if method.is_empty() || !method.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    let lower = target.get(..7)?.to_ascii_lowercase();
+    if lower != "http://" {
+        return None;
+    }
+    let rest = &target[7..];
+    let (auth, path) = match rest.find(['/', '?']) {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let path = if path.starts_with('?') {
+        format!("/{path}")
+    } else {
+        path.to_string()
+    };
+    let (host, port) = parse_authority(auth, Some(80))?;
+    if !version.starts_with("HTTP/1.") {
+        return None;
+    }
+    let mut head = format!("{method} {path} {version}\r\n");
+    let mut have_host = false;
+    for h in headers {
+        let name = h.split(':').next().unwrap_or("").trim().to_ascii_lowercase();
+        match name.as_str() {
+            "proxy-connection" | "proxy-authorization" | "connection" | "keep-alive" => continue,
+            "host" => {
+                have_host = true;
+                head.push_str(&format!("Host: {auth}\r\n"));
+            }
+            _ => head.push_str(h.trim_end_matches(['\r', '\n'])),
+        }
+        if name != "host" {
+            head.push_str("\r\n");
+        }
+    }
+    if !have_host {
+        head.push_str(&format!("Host: {auth}\r\n"));
+    }
+    head.push_str("Connection: close\r\n\r\n");
+    Some((host, port, head))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authority() {
+        assert_eq!(parse_authority("a.b:443", None), Some(("a.b".into(), 443)));
+        assert_eq!(parse_authority("[::1]:8080", None), Some(("[::1]".into(), 8080)));
+        assert_eq!(parse_authority("a.b", Some(80)), Some(("a.b".into(), 80)));
+        assert_eq!(parse_authority("a.b", None), None);
+        assert_eq!(parse_authority("u@a.b:1", None), None);
+        assert_eq!(parse_authority("::1:80", None), None);
+    }
+
+    #[test]
+    fn forward_rewrites_to_origin_form() {
+        let hs = vec![
+            "Host: evil.example\r\n".to_string(),
+            "Proxy-Connection: keep-alive\r\n".to_string(),
+            "Accept: */*\r\n".to_string(),
+        ];
+        let (h, p, head) = forward_head("GET", "http://x.test:8080/a?b=1", "HTTP/1.1", &hs).unwrap();
+        assert_eq!((h.as_str(), p), ("x.test", 8080));
+        assert_eq!(
+            head,
+            "GET /a?b=1 HTTP/1.1\r\nHost: x.test:8080\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+        );
+        assert!(forward_head("GET", "https://x/", "HTTP/1.1", &[]).is_none());
+        assert!(forward_head("GET", "/relative", "HTTP/1.1", &[]).is_none());
+        let (_, p, head) = forward_head("GET", "http://x.test", "HTTP/1.0", &[]).unwrap();
+        assert_eq!(p, 80);
+        assert!(head.starts_with("GET / HTTP/1.0\r\nHost: x.test\r\n"));
+    }
+
+    #[test]
+    fn exports() {
+        let e = export_lines("127.0.0.1:1080");
+        assert!(e.contains("export HTTPS_PROXY=http://127.0.0.1:1080"));
+        assert!(e.contains("export ALL_PROXY=socks5h://127.0.0.1:1080"));
     }
 }
