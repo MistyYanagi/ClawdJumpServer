@@ -30,14 +30,42 @@ use crate::{LONG_POLL, SESSION_GRACE};
 /// the client's authenticated static key. Transport-level checks (version,
 /// clock skew, replay) have already passed.
 pub trait Authenticator: Send + Sync + 'static {
-    fn authenticate(&self, client_key: &[u8; 32], hello: &Hello) -> Result<Welcome, ProtoError>;
-    /// Called for every rejected handshake (for audit).
-    fn rejected(&self, _client_key: Option<&[u8; 32]>, _err: &ProtoError) {}
+    /// `peer` is the client's address as seen by the server (or as given by
+    /// `X-Forwarded-For` when the server is configured to trust it).
+    fn authenticate(
+        &self,
+        client_key: &[u8; 32],
+        hello: &Hello,
+        peer: Option<&str>,
+    ) -> Result<Welcome, ProtoError>;
+    /// Called for transport-level rejections (version, skew, replay,
+    /// broken handshake) so they can be audited.
+    fn rejected(&self, _client_key: Option<&[u8; 32]>, _err: &ProtoError, _peer: Option<&str>) {}
 }
 
 pub struct TransportServerConfig {
     pub key: StaticKeypair,
     pub auth: Arc<dyn Authenticator>,
+    /// Take the client address from `X-Forwarded-For` (only behind a
+    /// trusted reverse proxy).
+    pub trust_forwarded_for: bool,
+}
+
+/// Client address of a request: the socket peer (needs the router to be
+/// served with `into_make_service_with_connect_info::<SocketAddr>()`), or
+/// the first `X-Forwarded-For` entry when `trust_forwarded` is set.
+pub fn peer_addr(ext: &axum::http::Extensions, headers: &HeaderMap, trust_forwarded: bool) -> Option<String> {
+    if trust_forwarded {
+        if let Some(v) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            if let Some(first) = v.split(',').next().map(str::trim).filter(|s| !s.is_empty()) {
+                if first.parse::<std::net::IpAddr>().is_ok() {
+                    return Some(first.to_string());
+                }
+            }
+        }
+    }
+    ext.get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip().to_string())
 }
 
 /// A newly established session.
@@ -50,6 +78,8 @@ pub struct Accepted {
     pub sid: String,
     /// "ws" or "http".
     pub transport: &'static str,
+    /// Client address at handshake time.
+    pub peer: Option<String>,
 }
 
 impl std::fmt::Debug for Accepted {
@@ -147,19 +177,20 @@ impl TransportServer {
         &self,
         msg1: &[u8],
         transport: &'static str,
+        peer: Option<String>,
     ) -> Result<(Vec<u8>, Option<String>), ProtoError> {
         let inner = &self.inner;
         let out = handshake::respond(&inner.cfg.key.private, msg1, |key, hello| {
             if let Err(e) = self.precheck(key, hello) {
-                inner.cfg.auth.rejected(Some(key), &e);
+                inner.cfg.auth.rejected(Some(key), &e, peer.as_deref());
                 return Err(e);
             }
-            inner.cfg.auth.authenticate(key, hello)
+            inner.cfg.auth.authenticate(key, hello, peer.as_deref())
         });
         let out = match out {
             Ok(o) => o,
             Err(e) => {
-                inner.cfg.auth.rejected(None, &e);
+                inner.cfg.auth.rejected(None, &e, peer.as_deref());
                 return Err(e);
             }
         };
@@ -190,6 +221,7 @@ impl TransportServer {
             welcome,
             sid: sid.clone(),
             transport,
+            peer,
         };
         if inner.accept_tx.try_send(acc).is_err() {
             core.close(ProtoError::new(ErrorCode::LimitExceeded, "server busy"));
@@ -259,12 +291,18 @@ pub(crate) fn random_id() -> String {
 // WebSocket
 // ---------------------------------------------------------------------------
 
-async fn ws_handler(State(srv): State<TransportServer>, ws: WebSocketUpgrade) -> Response {
+async fn ws_handler(
+    State(srv): State<TransportServer>,
+    ext: axum::http::Extensions,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let peer = peer_addr(&ext, &headers, srv.inner.cfg.trust_forwarded_for);
     ws.max_message_size(2 * 1024 * 1024)
-        .on_upgrade(move |sock| ws_conn(srv, sock))
+        .on_upgrade(move |sock| ws_conn(srv, sock, peer))
 }
 
-async fn ws_conn(srv: TransportServer, sock: WebSocket) {
+async fn ws_conn(srv: TransportServer, sock: WebSocket, peer: Option<String>) {
     let (mut sink, stream) = sock.split();
     let mut stream = Box::pin(stream.filter_map(|m| async move {
         match m {
@@ -276,7 +314,7 @@ async fn ws_conn(srv: TransportServer, sock: WebSocket) {
     let send = |m: WireMsg| Message::Binary(encode(&m).into());
     let first = tokio::time::timeout(Duration::from_secs(15), stream.next()).await;
     let (sess, peer_ack) = match first {
-        Ok(Some(Some(WireMsg::Hello { noise }))) => match srv.handshake(&noise, "ws") {
+        Ok(Some(Some(WireMsg::Hello { noise }))) => match srv.handshake(&noise, "ws", peer) {
             Ok((msg2, Some(sid))) => {
                 if sink
                     .send(send(WireMsg::Welcome {
@@ -373,8 +411,14 @@ fn bin(status: StatusCode, body: Vec<u8>) -> Response {
     (status, [("content-type", "application/octet-stream")], body).into_response()
 }
 
-async fn http_open(State(srv): State<TransportServer>, body: Bytes) -> Response {
-    match srv.handshake(&body, "http") {
+async fn http_open(
+    State(srv): State<TransportServer>,
+    ext: axum::http::Extensions,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let peer = peer_addr(&ext, &headers, srv.inner.cfg.trust_forwarded_for);
+    match srv.handshake(&body, "http", peer) {
         Ok((msg, sid)) => bin(
             StatusCode::OK,
             encode(&HttpOpenResponse {

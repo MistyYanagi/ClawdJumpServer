@@ -162,6 +162,47 @@ pub fn decide(req: &AccessRequest, grants: &[Grant], full: &[FullAccess]) -> Dec
     }
 }
 
+/// What a principal may do on a device right now, ignoring network
+/// constraints and session limits (for device listings).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Visible {
+    pub actions: Vec<Action>,
+    pub roots: Vec<String>,
+    pub full_access: bool,
+}
+
+pub fn visible(req: &AccessRequest, grants: &[Grant], full: &[FullAccess]) -> Visible {
+    let mut v = Visible::default();
+    for g in grants.iter().filter(|g| g.enabled) {
+        if !subject_matches(&g.subject, req) || !target_matches(&g.target, req) {
+            continue;
+        }
+        if g.not_before.map(|t| req.now < t).unwrap_or(false)
+            || g.expires_at.map(|t| req.now >= t).unwrap_or(false)
+            || g.schedule.as_ref().map(|s| !s.contains(req.now)).unwrap_or(false)
+        {
+            continue;
+        }
+        for a in &g.actions {
+            if !v.actions.contains(a) {
+                v.actions.push(*a);
+            }
+        }
+        for r in &g.project_roots {
+            if !v.roots.contains(r) {
+                v.roots.push(r.clone());
+            }
+        }
+    }
+    v.actions.sort();
+    v.full_access = !v.actions.is_empty()
+        && req.device.is_some_and(|d| {
+            full.iter()
+                .any(|f| f.principal == req.principal && f.device == d && f.is_active(req.now))
+        });
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +369,16 @@ mod tests {
         let mut r = req(Action::Shell);
         r.now = now + 3601;
         assert!(decide(&r, &[g], &[fa]).full_access.is_none(), "expired");
+    }
+
+    #[test]
+    fn visible_actions() {
+        let g = grant(&[Action::Shell, Action::FileRead]);
+        let v = visible(&req(Action::Shell), &[g.clone()], &[]);
+        assert_eq!(v.actions, vec![Action::Shell, Action::FileRead]);
+        let mut r = req(Action::Shell);
+        r.principal = "other";
+        assert!(visible(&r, &[g], &[]).actions.is_empty());
     }
 
     #[test]

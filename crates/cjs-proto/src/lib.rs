@@ -552,6 +552,9 @@ pub struct Capability {
     pub target: Option<String>,
     /// Audit session id.
     pub session: String,
+    /// JSON list of network rules (`cjs_authz::net::NetRule`) the device
+    /// must apply to resolved addresses for egress (post-DNS SSRF check).
+    pub net_rules: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -567,6 +570,170 @@ pub struct SignedCapability {
 pub struct DeviceOpen {
     pub cap: SignedCapability,
     pub req: OpenRequest,
+}
+
+// ---------------------------------------------------------------------------
+// Request validation (shared by server and device)
+// ---------------------------------------------------------------------------
+
+/// Longest path or argument accepted in a request.
+pub const MAX_ARG_LEN: usize = 4096;
+/// Most argv entries / environment variables in a request.
+pub const MAX_ARGS: usize = 256;
+pub const MAX_ENV: usize = 128;
+/// Largest terminal accepted.
+pub const MAX_TERM_DIM: u16 = 1000;
+/// Longest exec timeout (24h).
+pub const MAX_EXEC_TIMEOUT_SECS: u64 = 24 * 3600;
+
+fn bad(m: impl Into<String>) -> ProtoError {
+    ProtoError::new(ErrorCode::BadRequest, m)
+}
+
+fn check_str(what: &str, s: &str) -> Result<(), ProtoError> {
+    if s.len() > MAX_ARG_LEN {
+        return Err(bad(format!("{what} too long")));
+    }
+    if s.contains('\0') {
+        return Err(bad(format!("{what} contains NUL")));
+    }
+    Ok(())
+}
+
+/// Validate an environment variable name. Loader-controlling variables are
+/// refused outright: they could run code in a helper before the sandbox is
+/// applied.
+pub fn check_env_name(k: &str) -> Result<(), ProtoError> {
+    let mut chars = k.chars();
+    let ok_first = chars
+        .next()
+        .map(|c| c.is_ascii_alphabetic() || c == '_')
+        .unwrap_or(false);
+    if !ok_first || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || k.len() > 128 {
+        return Err(bad(format!("invalid environment variable name {k:?}")));
+    }
+    let up = k.to_ascii_uppercase();
+    if up.starts_with("LD_") || up.starts_with("DYLD_") || up == "GLIBC_TUNABLES" || up.starts_with("MALLOC_")
+    {
+        return Err(ProtoError::new(
+            ErrorCode::Forbidden,
+            format!("environment variable {k} is not allowed"),
+        ));
+    }
+    Ok(())
+}
+
+/// `TERM` values: short and made of safe characters only.
+pub fn check_term(t: &str) -> Result<(), ProtoError> {
+    if t.is_empty() || t.len() > 64 || !t.chars().all(|c| c.is_ascii_alphanumeric() || "-_.+".contains(c)) {
+        return Err(bad("invalid TERM"));
+    }
+    Ok(())
+}
+
+fn check_host(h: &str) -> Result<(), ProtoError> {
+    if h.is_empty() || h.len() > 253 {
+        return Err(bad("invalid host"));
+    }
+    if !h
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-._:[]%".contains(c))
+    {
+        return Err(bad("invalid host"));
+    }
+    Ok(())
+}
+
+/// Structural checks on a request before any policy decision.
+pub fn validate_request(r: &OpenRequest) -> Result<(), ProtoError> {
+    if let Some(d) = r.device() {
+        check_str("device", d)?;
+        if d.len() > 128 {
+            return Err(bad("device name too long"));
+        }
+    }
+    match r {
+        OpenRequest::Pty {
+            cols,
+            rows,
+            term,
+            command,
+            cwd,
+            ..
+        } => {
+            if *cols == 0 || *rows == 0 || *cols > MAX_TERM_DIM || *rows > MAX_TERM_DIM {
+                return Err(bad("invalid terminal size"));
+            }
+            check_term(term)?;
+            if let Some(c) = command {
+                if c.is_empty() || c.len() > MAX_ARGS {
+                    return Err(bad("invalid command"));
+                }
+                for a in c {
+                    check_str("argument", a)?;
+                }
+            }
+            if let Some(c) = cwd {
+                check_str("cwd", c)?;
+            }
+        }
+        OpenRequest::Exec {
+            argv,
+            cwd,
+            env,
+            timeout_secs,
+            ..
+        } => {
+            if argv.is_empty() || argv.len() > MAX_ARGS {
+                return Err(bad("invalid argv"));
+            }
+            for a in argv {
+                check_str("argument", a)?;
+            }
+            if let Some(c) = cwd {
+                check_str("cwd", c)?;
+            }
+            if env.len() > MAX_ENV {
+                return Err(bad("too many environment variables"));
+            }
+            for (k, v) in env {
+                check_env_name(k)?;
+                check_str("environment value", v)?;
+            }
+            if timeout_secs
+                .map(|t| t == 0 || t > MAX_EXEC_TIMEOUT_SECS)
+                .unwrap_or(false)
+            {
+                return Err(bad("invalid timeout"));
+            }
+        }
+        OpenRequest::FileGet { path, .. } | OpenRequest::FileList { path, .. } => check_str("path", path)?,
+        OpenRequest::FilePut {
+            path, offset, size, ..
+        } => {
+            check_str("path", path)?;
+            if offset > size {
+                return Err(bad("offset beyond size"));
+            }
+        }
+        OpenRequest::ForwardL { host, port, .. } | OpenRequest::Egress { host, port, .. } => {
+            check_host(host)?;
+            if *port == 0 {
+                return Err(bad("invalid port"));
+            }
+        }
+        OpenRequest::ForwardR {
+            bind_host, bind_port, ..
+        } => {
+            check_host(bind_host)?;
+            if *bind_port == 0 {
+                return Err(bad("invalid port"));
+            }
+        }
+        OpenRequest::ForwardRConn { peer, .. } => check_str("peer", peer)?,
+        OpenRequest::Rpc(_) => {}
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -756,6 +923,32 @@ mod tests {
         for a in Action::ALL {
             assert_eq!(Action::parse(a.as_str()), Some(a));
         }
+    }
+
+    #[test]
+    fn validation() {
+        let exec = |env: Vec<(String, String)>| OpenRequest::Exec {
+            device: "d".into(),
+            argv: vec!["ls".into()],
+            cwd: None,
+            env,
+            timeout_secs: None,
+        };
+        assert!(validate_request(&exec(vec![("FOO".into(), "1".into())])).is_ok());
+        assert!(validate_request(&exec(vec![("LD_PRELOAD".into(), "/x.so".into())])).is_err());
+        assert!(validate_request(&exec(vec![("dyld_insert_libraries".into(), "x".into())])).is_err());
+        assert!(validate_request(&exec(vec![("A=B".into(), "x".into())])).is_err());
+        let pty = |cols, term: &str| OpenRequest::Pty {
+            device: "d".into(),
+            cols,
+            rows: 24,
+            term: term.into(),
+            command: None,
+            cwd: None,
+        };
+        assert!(validate_request(&pty(80, "xterm-256color")).is_ok());
+        assert!(validate_request(&pty(0, "xterm")).is_err());
+        assert!(validate_request(&pty(80, "x\u{1b}]0;")).is_err());
     }
 
     #[test]

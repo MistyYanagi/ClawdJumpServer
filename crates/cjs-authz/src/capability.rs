@@ -57,13 +57,14 @@ impl CapVerifier {
         }
     }
 
-    /// Verify `signed` for request `req` arriving on connection
-    /// `connection_id`. Returns the capability on success.
+    /// Verify `signed` for request `req` arriving on stream `stream` of
+    /// connection `connection_id`. Returns the capability on success.
     pub fn verify(
         &self,
         signed: &SignedCapability,
         req: &OpenRequest,
         connection_id: &str,
+        stream: u32,
         now: i64,
     ) -> Result<Capability, ProtoError> {
         let sig = ed25519_dalek::Signature::from_slice(&signed.sig)
@@ -82,6 +83,9 @@ impl CapVerifier {
         }
         if cap.connection != connection_id {
             return Err(deny("capability bound to another connection"));
+        }
+        if cap.stream != stream {
+            return Err(deny("capability bound to another stream"));
         }
         if now > cap.expires_at || now + SKEW < cap.issued_at || cap.expires_at - cap.issued_at > CAP_TTL_SECS
         {
@@ -134,6 +138,7 @@ mod tests {
             connection: "c1".into(),
             target: None,
             session: "s1".into(),
+            net_rules: None,
         };
         (key, v, cap, req)
     }
@@ -142,9 +147,9 @@ mod tests {
     fn valid_once() {
         let (k, v, cap, req) = setup();
         let s = sign(&k, &cap);
-        assert!(v.verify(&s, &req, "c1", 1010).is_ok());
+        assert!(v.verify(&s, &req, "c1", 1, 1010).is_ok());
         assert_eq!(
-            v.verify(&s, &req, "c1", 1011).unwrap_err().code,
+            v.verify(&s, &req, "c1", 1, 1011).unwrap_err().code,
             ErrorCode::Replay
         );
     }
@@ -154,32 +159,41 @@ mod tests {
         let (k, v, cap, req) = setup();
         // Forged by another key.
         let other = SigningKey::generate(&mut rand::rngs::OsRng);
-        assert!(v.verify(&sign(&other, &cap), &req, "c1", 1010).is_err());
+        assert!(v.verify(&sign(&other, &cap), &req, "c1", 1, 1010).is_err());
         // Tampered body.
         let mut s = sign(&k, &cap);
         let mut c2 = cap.clone();
         c2.full_access = true;
         s.body = encode(&c2);
-        assert!(v.verify(&s, &req, "c1", 1010).is_err());
+        assert!(v.verify(&s, &req, "c1", 1, 1010).is_err());
         // Wrong device, connection, action, expiry.
         let mut c = cap.clone();
         c.device = "d2".into();
-        assert!(v.verify(&sign(&k, &c), &req, "c1", 1010).is_err());
-        assert!(v.verify(&sign(&k, &cap), &req, "c2", 1010).is_err());
+        assert!(v.verify(&sign(&k, &c), &req, "c1", 1, 1010).is_err());
+        assert!(v.verify(&sign(&k, &cap), &req, "c2", 1, 1010).is_err());
         let mut c = cap.clone();
         c.id = new_id();
         c.action = Action::Shell;
-        assert!(v.verify(&sign(&k, &c), &req, "c1", 1010).is_err());
+        assert!(v.verify(&sign(&k, &c), &req, "c1", 1, 1010).is_err());
         let mut c = cap.clone();
         c.id = new_id();
         assert_eq!(
-            v.verify(&sign(&k, &c), &req, "c1", 2000).unwrap_err().code,
+            v.verify(&sign(&k, &c), &req, "c1", 1, 2000).unwrap_err().code,
             ErrorCode::Expired
         );
         let mut c = cap;
         c.id = new_id();
         c.expires_at = c.issued_at + 3600;
-        assert!(v.verify(&sign(&k, &c), &req, "c1", 1010).is_err(), "overlong ttl");
+        assert!(
+            v.verify(&sign(&k, &c), &req, "c1", 1, 1010).is_err(),
+            "overlong ttl"
+        );
+    }
+
+    #[test]
+    fn stream_bound() {
+        let (k, v, cap, req) = setup();
+        assert!(v.verify(&sign(&k, &cap), &req, "c1", 2, 1010).is_err());
     }
 
     #[test]
@@ -197,8 +211,8 @@ mod tests {
             host: "127.0.0.1".into(),
             port: 22,
         };
-        assert!(v.verify(&sign(&k, &cap), &bad, "c1", 1010).is_err());
+        assert!(v.verify(&sign(&k, &cap), &bad, "c1", 1, 1010).is_err());
         cap.id = new_id();
-        assert!(v.verify(&sign(&k, &cap), &ok, "c1", 1010).is_ok());
+        assert!(v.verify(&sign(&k, &cap), &ok, "c1", 1, 1010).is_ok());
     }
 }

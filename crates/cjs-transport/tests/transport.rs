@@ -12,7 +12,12 @@ use tokio::net::{TcpListener, TcpStream};
 struct AllowKey(Vec<[u8; 32]>);
 
 impl Authenticator for AllowKey {
-    fn authenticate(&self, key: &[u8; 32], _hello: &Hello) -> Result<Welcome, ProtoError> {
+    fn authenticate(
+        &self,
+        key: &[u8; 32],
+        _hello: &Hello,
+        _peer: Option<&str>,
+    ) -> Result<Welcome, ProtoError> {
         if self.0.contains(key) {
             Ok(Welcome {
                 principal_id: "p1".into(),
@@ -81,6 +86,7 @@ async fn server(allowed: Vec<[u8; 32]>) -> (TransportServer, std::net::SocketAdd
     let (srv, mut acc) = TransportServer::new(TransportServerConfig {
         key: key.clone(),
         auth: Arc::new(AllowKey(allowed)),
+        trust_forwarded_for: false,
     });
     let app = srv.router();
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -275,6 +281,7 @@ async fn server_can_cut_session() {
     let (srv, mut acc) = TransportServer::new(TransportServerConfig {
         key: key.clone(),
         auth: Arc::new(AllowKey(vec![ck.public])),
+        trust_forwarded_for: false,
     });
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();

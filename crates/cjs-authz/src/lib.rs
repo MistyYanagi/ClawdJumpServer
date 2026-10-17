@@ -13,4 +13,4 @@ pub mod net;
 pub mod pdp;
 
 pub use model::*;
-pub use pdp::{decide, AccessRequest, Decision};
+pub use pdp::{decide, visible, AccessRequest, Decision, Visible};

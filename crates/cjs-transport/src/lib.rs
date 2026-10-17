@@ -32,7 +32,7 @@ pub use crate::core::SessionHandle;
 pub use crate::io::SessionIo;
 pub use client::{connect, ClientConfig, ClientConn, TransportMode};
 pub use keys::StaticKeypair;
-pub use server::{Accepted, Authenticator, TransportServer, TransportServerConfig};
+pub use server::{peer_addr, Accepted, Authenticator, TransportServer, TransportServerConfig};
 
 /// How long a session survives without any attached link.
 pub const SESSION_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
