@@ -1,6 +1,31 @@
 [package]
 name = "cjs-tests"
-version = "0.1.0"
-edition = "2024"
+description = "End-to-end and 4A conformance tests for ClawdJumpServer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "cjs-test-helper"
+path = "src/bin/cjs-test-helper.rs"
 
 [dependencies]
+cjs-proto.workspace = true
+cjs-mux.workspace = true
+cjs-transport.workspace = true
+cjs-authz.workspace = true
+cjs-audit.workspace = true
+cjs-sandbox.workspace = true
+cjs-server.workspace = true
+cjs-device.workspace = true
+tokio.workspace = true
+axum.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+
+[lints]
+workspace = true

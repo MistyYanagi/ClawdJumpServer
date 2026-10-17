@@ -25,12 +25,13 @@ mod handshake;
 mod io;
 pub mod keys;
 mod link;
+pub mod profile;
 pub mod server;
 pub mod tls;
 
 pub use crate::core::SessionHandle;
 pub use crate::io::SessionIo;
-pub use client::{connect, ClientConfig, ClientConn, TransportMode};
+pub use client::{connect, new_hello, ClientConfig, ClientConn, TransportMode};
 pub use keys::StaticKeypair;
 pub use server::{peer_addr, Accepted, Authenticator, TransportServer, TransportServerConfig};
 

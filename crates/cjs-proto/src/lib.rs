@@ -169,6 +169,13 @@ impl ClientInfo {
             arch: std::env::consts::ARCH.to_string(),
             hostname: std::env::var("HOSTNAME")
                 .or_else(|_| std::env::var("COMPUTERNAME"))
+                .ok()
+                .filter(|h| !h.is_empty())
+                .or_else(|| {
+                    std::fs::read_to_string("/etc/hostname")
+                        .ok()
+                        .map(|h| h.trim().to_string())
+                })
                 .unwrap_or_default(),
             version: version.to_string(),
         }

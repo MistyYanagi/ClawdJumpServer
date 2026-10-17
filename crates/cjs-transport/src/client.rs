@@ -475,3 +475,21 @@ impl HttpLink {
         }
     }
 }
+
+/// Build a fresh handshake `Hello` (current time, random nonce).
+pub fn new_hello(role: cjs_proto::Role, enroll_secret: Option<String>, version: &str) -> Hello {
+    use rand::RngCore;
+    let mut nonce = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    Hello {
+        version: cjs_proto::PROTO_VERSION,
+        role,
+        ts: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+        nonce,
+        enroll: enroll_secret.map(|secret| cjs_proto::Enroll { secret }),
+        info: cjs_proto::ClientInfo::current(version),
+    }
+}

@@ -374,7 +374,7 @@ mod tests {
     #[test]
     fn visible_actions() {
         let g = grant(&[Action::Shell, Action::FileRead]);
-        let v = visible(&req(Action::Shell), &[g.clone()], &[]);
+        let v = visible(&req(Action::Shell), std::slice::from_ref(&g), &[]);
         assert_eq!(v.actions, vec![Action::Shell, Action::FileRead]);
         let mut r = req(Action::Shell);
         r.principal = "other";
