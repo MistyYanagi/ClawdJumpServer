@@ -670,8 +670,12 @@ dependencies = [
  "cjs-server",
  "cjs-transport",
  "ed25519-dalek",
+ "hex",
  "rand 0.8.8",
+ "reqwest",
+ "rusqlite",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
 ]

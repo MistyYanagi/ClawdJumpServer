@@ -69,6 +69,13 @@ pub fn current_code(secret_b32: &str) -> String {
         .unwrap_or_default()
 }
 
+/// TOTP code for a given 30-second time step (tests and tooling).
+pub fn code_for_step(secret_b32: &str, step: i64) -> String {
+    totp(secret_b32, "x")
+        .map(|t| t.generate((step * 30) as u64))
+        .unwrap_or_default()
+}
+
 /// Check a TOTP code, allowing one step of clock skew. Returns the matched
 /// time step, which must be newer than the last accepted one (no reuse).
 pub fn check_totp(secret_b32: &str, code: &str, last_step: i64) -> Option<i64> {

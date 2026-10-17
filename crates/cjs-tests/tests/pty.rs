@@ -101,12 +101,13 @@ async fn pty_shell_is_sandboxed() {
     let (mut s, _) = a.open(pty_req("dev1")).await.unwrap();
     let outside = env.tmp().join("outside.txt");
     let cmd = format!(
-        "echo x > {o} || echo BLOCKED; echo y > {p}/inside.txt && echo WROTE\n",
+        "echo x > {o} || echo BLOCKED; echo y > {p}/inside.txt && echo WROTE-$((40+2))\n",
         o = outside.display(),
         p = env.project.display()
     );
     write_msg(&mut s, &PtyIn::Input(cmd.into_bytes())).await.unwrap();
-    pty_expect(&mut s, "WROTE", 20).await.unwrap();
+    // The marker is computed by the shell, so the echoed input cannot match.
+    pty_expect(&mut s, "WROTE-42", 20).await.unwrap();
     assert!(!outside.exists(), "write outside the project must be blocked");
     assert!(env.project.join("inside.txt").exists());
 }

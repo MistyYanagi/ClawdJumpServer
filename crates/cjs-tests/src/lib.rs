@@ -31,6 +31,8 @@ pub struct Env {
     pub agent_dir: PathBuf,
     pub device_id: String,
     pub agent_id: String,
+    /// name -> (user id, password, TOTP secret)
+    pub creds: std::sync::Mutex<std::collections::HashMap<String, (String, String, String)>>,
     device_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -104,6 +106,13 @@ impl Env {
         server.shared.db.insert_user(&admin.user).unwrap();
         let owner = accounts::create_user("alice", vec![], None).unwrap();
         server.shared.db.insert_user(&owner.user).unwrap();
+        let mut creds = std::collections::HashMap::new();
+        for u in [&admin, &owner] {
+            creds.insert(
+                u.user.name.clone(),
+                (u.user.id.clone(), u.password.clone(), u.totp_secret.clone()),
+            );
+        }
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let project = std::fs::canonicalize(&project).unwrap();
@@ -134,6 +143,7 @@ impl Env {
             agent_dir,
             device_id: dp.id,
             agent_id: ap.id,
+            creds: std::sync::Mutex::new(creds),
             device_task: None,
         };
         env.start_device();
@@ -159,6 +169,58 @@ impl Env {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("device online != {online}");
+    }
+
+    /// Create a user directly in the database; returns its id.
+    pub fn add_user(&self, name: &str, roles: Vec<cjs_authz::Role>) -> String {
+        let u = accounts::create_user(name, roles, None).unwrap();
+        self.server.shared.db.insert_user(&u.user).unwrap();
+        self.creds
+            .lock()
+            .unwrap()
+            .insert(name.into(), (u.user.id.clone(), u.password, u.totp_secret));
+        u.user.id
+    }
+
+    pub fn cred(&self, name: &str) -> (String, String, String) {
+        self.creds.lock().unwrap().get(name).cloned().expect("known user")
+    }
+
+    /// Log in through the API. Each call uses a fresh TOTP time step (codes
+    /// cannot be reused), so a user can log in a few times per test.
+    pub async fn web(&self, name: &str) -> Web {
+        let (_, pw, secret) = self.cred(name);
+        let step = cjs_server::db::now() / 30;
+        let http = reqwest::Client::new();
+        for s in [step, step + 1, step - 1] {
+            let code = accounts::code_for_step(&secret, s);
+            let r = http
+                .post(format!("{}api/v1/login", self.url))
+                .json(&serde_json::json!({"name": name, "password": pw, "totp": code}))
+                .send()
+                .await
+                .unwrap();
+            if r.status().is_success() {
+                let cookie = r
+                    .headers()
+                    .get_all("set-cookie")
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .find_map(|c| {
+                        c.strip_prefix("cjs_session=")
+                            .map(|r| r.split(';').next().unwrap().to_string())
+                    })
+                    .unwrap();
+                let v: serde_json::Value = r.json().await.unwrap();
+                return Web {
+                    http,
+                    base: self.url.clone(),
+                    cookie,
+                    csrf: v["csrf"].as_str().unwrap().into(),
+                };
+            }
+        }
+        panic!("login of {name} failed");
     }
 
     pub fn tmp(&self) -> &Path {
@@ -216,6 +278,40 @@ impl Env {
             .into_iter()
             .map(|r| (r.record.event.kind, r.record.event.outcome.as_str().to_string()))
             .collect()
+    }
+}
+
+/// A logged-in API client.
+pub struct Web {
+    pub http: reqwest::Client,
+    pub base: String,
+    pub cookie: String,
+    pub csrf: String,
+}
+
+impl Web {
+    /// Call the API; returns (status, JSON body).
+    pub async fn call(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> (u16, serde_json::Value) {
+        let m: reqwest::Method = method.parse().unwrap();
+        let mut r = self
+            .http
+            .request(m.clone(), format!("{}api/v1{path}", self.base))
+            .header("cookie", format!("cjs_session={}", self.cookie));
+        if m != reqwest::Method::GET {
+            r = r.header("x-csrf-token", &self.csrf);
+        }
+        if let Some(b) = body {
+            r = r.json(&b);
+        }
+        let resp = r.send().await.unwrap();
+        let st = resp.status().as_u16();
+        let v = resp.json().await.unwrap_or(serde_json::Value::Null);
+        (st, v)
     }
 }
 
