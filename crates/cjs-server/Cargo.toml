@@ -39,7 +39,6 @@ mime_guess.workspace = true
 subtle.workspace = true
 url.workspace = true
 rcgen.workspace = true
-rustls-pemfile.workspace = true
 
 [[bin]]
 name = "cjs-server"

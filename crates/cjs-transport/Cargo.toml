@@ -24,7 +24,6 @@ tokio-tungstenite.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
-rustls-pemfile.workspace = true
 rustls-native-certs.workspace = true
 webpki-roots.workspace = true
 url.workspace = true

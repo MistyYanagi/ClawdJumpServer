@@ -212,16 +212,10 @@ fn init(data: &Path, admin: &str, hostnames: Vec<String>) {
 }
 
 fn load_tls(cert: &Path, key: &Path) -> Arc<rustls::ServerConfig> {
-    let certs = rustls_pemfile::certs(
-        &mut &std::fs::read(cert).unwrap_or_else(|e| die(format!("{}: {e}", cert.display())))[..],
-    )
-    .collect::<Result<Vec<_>, _>>()
-    .unwrap_or_else(|e| die(format!("{}: {e}", cert.display())));
-    let key = rustls_pemfile::private_key(
-        &mut &std::fs::read(key).unwrap_or_else(|e| die(format!("{}: {e}", key.display())))[..],
-    )
-    .unwrap_or_else(|e| die(format!("{}: {e}", key.display())))
-    .unwrap_or_else(|| die(format!("{}: no private key", key.display())));
+    use rustls::pki_types::pem::PemObject;
+    let certs = cjs_transport::tls::load_pem_certs(cert).unwrap_or_else(|e| die(e));
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_file(key)
+        .unwrap_or_else(|e| die(format!("{}: {e}", key.display())));
     let mut cfg =
         rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()

@@ -18,7 +18,8 @@ fn err(m: impl std::fmt::Display) -> ProtoError {
 
 pub fn load_pem_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, ProtoError> {
     let data = std::fs::read(path).map_err(|e| err(format!("{}: {e}", path.display())))?;
-    rustls_pemfile::certs(&mut &data[..])
+    use rustls::pki_types::pem::PemObject;
+    rustls::pki_types::CertificateDer::pem_slice_iter(&data)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| err(format!("{}: {e}", path.display())))
 }
