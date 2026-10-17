@@ -4,10 +4,12 @@
 //! with `postcard`. The layering is:
 //!
 //! ```text
-//! TLS (WebSocket message | HTTP batch)  ->  Noise IK transport message  ->  postcard(Frame)
+//! TLS (WebSocket | HTTP long-poll) -> WireMsg::Seg (seq/ack, resumable)
+//!     -> Noise transport message (nonce = seq) -> byte stream -> yamux
+//!     -> length-prefixed postcard messages per stream
 //! ```
 //!
-//! A [`Frame`] belongs to the multiplexer (`cjs-mux`). Each logical stream is
+//! Logical streams are multiplexed with yamux (`cjs-mux`). Each stream is
 //! opened with an [`OpenRequest`] (agent -> server) or a [`DeviceOpen`]
 //! (server -> device, carrying a signed capability). Inside a stream, data
 //! frames carry the per-kind messages ([`PtyIn`], [`ExecOut`], [`FileMsg`],
@@ -243,27 +245,63 @@ impl EnrollToken {
 }
 
 // ---------------------------------------------------------------------------
-// Multiplexer frames
+// Transport and stream framing
 // ---------------------------------------------------------------------------
 
+/// Messages of the resumable session layer. Over WebSocket each binary
+/// message is one postcard-encoded `WireMsg`. `Seg.data` is a Noise
+/// transport message whose nonce is `seq`, so segments are authenticated,
+/// replay-proof and can be re-sent verbatim after a reconnect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Frame {
-    /// Open stream `id`. `meta` is an encoded [`OpenRequest`] / [`DeviceOpen`].
-    Open { id: u32, meta: Vec<u8> },
-    OpenOk { id: u32 },
-    OpenErr { id: u32, err: ProtoError },
-    Data { id: u32, data: Vec<u8> },
-    /// Grant `credit` more bytes of send window to the peer for stream `id`.
-    Window { id: u32, credit: u32 },
-    /// Sender will send no more data on `id` (half close).
-    Close { id: u32 },
-    /// Abort stream `id` in both directions.
-    Reset { id: u32, err: ProtoError },
-    Ping(u64),
-    Pong(u64),
-    /// Connection is being shut down by the peer.
-    GoAway(ProtoError),
+pub enum WireMsg {
+    /// Client -> server: Noise IK message 1.
+    Hello {
+        noise: Vec<u8>,
+    },
+    /// Server -> client: Noise IK message 2 plus the session id. The resume
+    /// secret is derived by both sides from the Noise handshake hash and is
+    /// never sent in this message.
+    Welcome {
+        sid: String,
+        noise: Vec<u8>,
+    },
+    /// Client -> server: re-attach to an existing session. `ack` is the
+    /// highest segment the client has received.
+    Resume {
+        sid: String,
+        secret: String,
+        ack: u64,
+    },
+    /// Server -> client: resume accepted; `ack` is the highest segment the
+    /// server has received.
+    Resumed {
+        ack: u64,
+    },
+    Reject(ProtoError),
+    Seg {
+        seq: u64,
+        data: Vec<u8>,
+    },
+    Ack(u64),
+    /// The session is over (not just this link).
+    Close(ProtoError),
 }
+
+/// First reply on every multiplexed stream, after the opener sent its
+/// [`OpenRequest`] / [`DeviceOpen`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpenReply {
+    /// `id` is the server-assigned stream id (audit reference; for
+    /// `ForwardR` it is the listener id later used in `ForwardRConn`).
+    Ok {
+        id: u32,
+        session: String,
+    },
+    Err(ProtoError),
+}
+
+/// Largest single length-prefixed message on a stream.
+pub const MAX_STREAM_MSG: usize = 1024 * 1024;
 
 /// Actions a grant can allow. Each stream kind maps to exactly one action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -483,9 +521,7 @@ impl OpenRequest {
                 Some(format!("{host}:{port}"))
             }
             OpenRequest::ForwardR {
-                bind_host,
-                bind_port,
-                ..
+                bind_host, bind_port, ..
             } => Some(format!("{bind_host}:{bind_port}")),
             _ => None,
         }
@@ -593,12 +629,21 @@ pub struct DirEntry {
 ///   `End`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileMsg {
-    Meta { size: u64, mode: u32, mtime: i64 },
+    Meta {
+        size: u64,
+        mode: u32,
+        mtime: i64,
+    },
     Chunk(Vec<u8>),
     /// Full-file SHA-256 (hex), computed over the whole file, not only the
     /// transferred range, so resumed transfers can be checked end to end.
-    End { sha256: Option<String> },
-    Done { size: u64, sha256: String },
+    End {
+        sha256: Option<String>,
+    },
+    Done {
+        size: u64,
+        sha256: String,
+    },
     Stat(DirEntry),
     Entries(Vec<DirEntry>),
 }
@@ -648,7 +693,7 @@ pub struct HttpOpenResponse {
 }
 
 /// Body of `POST /v1/t/{sid}/tx` and of `GET /v1/t/{sid}/rx` responses:
-/// sequence-numbered Noise transport messages.
+/// sequence-numbered Noise transport messages (same as `WireMsg::Seg`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HttpBatch {
     /// For `tx` requests: highest downlink seq the client has received.
@@ -675,13 +720,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frame_roundtrip() {
-        let f = Frame::Data {
-            id: 7,
+    fn wire_roundtrip() {
+        let f = WireMsg::Seg {
+            seq: 7,
             data: vec![1, 2, 3],
         };
         let b = encode(&f);
-        assert_eq!(decode::<Frame>(&b).unwrap(), f);
+        assert_eq!(decode::<WireMsg>(&b).unwrap(), f);
     }
 
     #[test]
@@ -715,7 +760,7 @@ mod tests {
 
     #[test]
     fn decode_garbage_is_protocol_error() {
-        let e = decode::<Frame>(&[0xff, 0xff, 0xff]).unwrap_err();
+        let e = decode::<WireMsg>(&[0xff, 0xff, 0xff]).unwrap_err();
         assert_eq!(e.code, ErrorCode::Protocol);
     }
 }
