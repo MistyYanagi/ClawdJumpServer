@@ -2,23 +2,88 @@
 //! forward proxying (`GET http://host/path`) on one port.
 //! Every connection becomes an `Egress` stream, decided and audited by the
 //! server (optionally exiting through a device).
+//!
+//! By default the proxy requires credentials (SOCKS5 username/password,
+//! HTTP `Proxy-Authorization: Basic`) generated at start-up and printed in
+//! the `export` lines, so other local users or processes cannot borrow the
+//! agent's identity through it.
 use std::time::Duration;
 
 use cjs_proto::{ErrorCode, OpenRequest, ProtoError};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
+use base64::Engine as _;
+use subtle::ConstantTimeEq;
+
 use crate::local::Opener;
+
+/// Proxy credentials.
+#[derive(Clone)]
+pub struct Auth {
+    pub user: String,
+    pub pass: String,
+}
+
+impl Auth {
+    /// Fresh random credentials.
+    pub fn generate() -> Self {
+        use rand::RngCore;
+        let mut b = [0u8; 18];
+        rand::rngs::OsRng.fill_bytes(&mut b);
+        Auth {
+            user: "cjs".into(),
+            pass: hex::encode(b),
+        }
+    }
+
+    fn check(&self, user: &[u8], pass: &[u8]) -> bool {
+        let u: bool = self.user.as_bytes().ct_eq(user).into();
+        let p: bool = self.pass.as_bytes().ct_eq(pass).into();
+        u & p
+    }
+
+    fn check_header(&self, value: &str) -> bool {
+        let Some(b64) = value
+            .trim()
+            .strip_prefix("Basic ")
+            .or_else(|| value.trim().strip_prefix("basic "))
+        else {
+            return false;
+        };
+        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) else {
+            return false;
+        };
+        match raw.iter().position(|&c| c == b':') {
+            Some(i) => self.check(&raw[..i], &raw[i + 1..]),
+            None => false,
+        }
+    }
+}
 
 fn ioe(e: std::io::Error) -> ProtoError {
     ProtoError::new(ErrorCode::Io, e.to_string())
 }
 
-pub async fn run(op: Opener, bind: &str, via: Option<String>) -> Result<(), ProtoError> {
+pub async fn run(
+    op: Opener,
+    bind: &str,
+    via: Option<String>,
+    auth: Option<Auth>,
+    env_file: Option<std::path::PathBuf>,
+) -> Result<(), ProtoError> {
     let l = TcpListener::bind(bind)
         .await
         .map_err(|e| ProtoError::new(ErrorCode::Io, format!("listen {bind}: {e}")))?;
     let addr = l.local_addr().map_err(ioe)?;
+    if !addr.ip().is_loopback() {
+        eprintln!("warning: the proxy listens on a non-loopback address; other hosts can reach it");
+    }
+    if auth.is_none() {
+        eprintln!(
+            "warning: proxy authentication is disabled; any local process can use this agent's identity"
+        );
+    }
     eprintln!(
         "proxy listening on {addr} (SOCKS5, HTTP CONNECT and HTTP forward){}",
         via.as_ref()
@@ -26,37 +91,68 @@ pub async fn run(op: Opener, bind: &str, via: Option<String>) -> Result<(), Prot
             .unwrap_or_default()
     );
     // Lines for `eval "$(cjs proxy)"`; diagnostics go to stderr.
-    println!("{}", export_lines(&addr.to_string()));
-    use std::io::Write as _;
-    let _ = std::io::stdout().flush();
+    let lines = export_lines(&addr.to_string(), auth.as_ref());
+    match env_file {
+        Some(p) => write_private(&p, &format!("{lines}\n"))
+            .map_err(|e| ProtoError::new(ErrorCode::Io, format!("{}: {e}", p.display())))?,
+        None => {
+            println!("{lines}");
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        }
+    }
     loop {
         let (tcp, peer) = l.accept().await.map_err(ioe)?;
         let op = op.clone();
         let via = via.clone();
+        let auth = auth.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(op, tcp, via).await {
+            if let Err(e) = handle(op, tcp, via, auth).await {
                 tracing::info!(%peer, err = %e, "proxy connection failed");
             }
         });
     }
 }
 
+/// Write `data` to a file only the current user can read.
+fn write_private(p: &std::path::Path, data: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let _ = std::fs::remove_file(p);
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    let mut f = o.open(p)?;
+    f.write_all(data.as_bytes())
+}
+
 /// Shell `export` lines pointing common tools at the proxy.
-pub fn export_lines(addr: &str) -> String {
-    let http = format!("http://{addr}");
+pub fn export_lines(addr: &str, auth: Option<&Auth>) -> String {
+    let cred = auth
+        .map(|a| format!("{}:{}@", a.user, a.pass))
+        .unwrap_or_default();
+    let http = format!("http://{cred}{addr}");
     let mut out = String::new();
     for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
         out.push_str(&format!("export {k}={http}\n"));
     }
     for k in ["ALL_PROXY", "all_proxy"] {
-        out.push_str(&format!("export {k}=socks5h://{addr}\n"));
+        out.push_str(&format!("export {k}=socks5h://{cred}{addr}\n"));
     }
     out.push_str("export NO_PROXY=localhost,127.0.0.1,::1\n");
     out.push_str("export no_proxy=localhost,127.0.0.1,::1");
     out
 }
 
-async fn handle(op: Opener, tcp: TcpStream, via: Option<String>) -> Result<(), ProtoError> {
+async fn handle(
+    op: Opener,
+    tcp: TcpStream,
+    via: Option<String>,
+    auth: Option<Auth>,
+) -> Result<(), ProtoError> {
     let _ = tcp.set_nodelay(true);
     let mut first = [0u8; 1];
     tokio::time::timeout(Duration::from_secs(30), tcp.peek(&mut first))
@@ -64,25 +160,54 @@ async fn handle(op: Opener, tcp: TcpStream, via: Option<String>) -> Result<(), P
         .map_err(|_| ProtoError::new(ErrorCode::Timeout, "client sent nothing"))?
         .map_err(ioe)?;
     if first[0] == 5 {
-        socks5(op, tcp, via).await
+        socks5(op, tcp, via, auth).await
     } else {
-        http_connect(op, tcp, via).await
+        http_connect(op, tcp, via, auth).await
     }
 }
 
-async fn socks5(op: Opener, mut tcp: TcpStream, via: Option<String>) -> Result<(), ProtoError> {
+async fn socks5(
+    op: Opener,
+    mut tcp: TcpStream,
+    via: Option<String>,
+    auth: Option<Auth>,
+) -> Result<(), ProtoError> {
     let mut h = [0u8; 2];
     tcp.read_exact(&mut h).await.map_err(ioe)?;
     let mut methods = vec![0u8; h[1] as usize];
     tcp.read_exact(&mut methods).await.map_err(ioe)?;
-    if !methods.contains(&0) {
+    let want = if auth.is_some() { 2 } else { 0 };
+    if !methods.contains(&want) {
         tcp.write_all(&[5, 0xff]).await.map_err(ioe)?;
         return Err(ProtoError::new(
-            ErrorCode::Unsupported,
-            "client needs SOCKS authentication",
+            ErrorCode::Unauthenticated,
+            if want == 2 {
+                "client did not offer SOCKS username/password authentication"
+            } else {
+                "client needs SOCKS authentication"
+            },
         ));
     }
-    tcp.write_all(&[5, 0]).await.map_err(ioe)?;
+    tcp.write_all(&[5, want]).await.map_err(ioe)?;
+    if let Some(a) = &auth {
+        // RFC 1929 sub-negotiation.
+        let mut v = [0u8; 2];
+        tcp.read_exact(&mut v).await.map_err(ioe)?;
+        let mut user = vec![0u8; v[1] as usize];
+        tcp.read_exact(&mut user).await.map_err(ioe)?;
+        let mut pl = [0u8; 1];
+        tcp.read_exact(&mut pl).await.map_err(ioe)?;
+        let mut pass = vec![0u8; pl[0] as usize];
+        tcp.read_exact(&mut pass).await.map_err(ioe)?;
+        if v[0] != 1 || !a.check(&user, &pass) {
+            let _ = tcp.write_all(&[1, 1]).await;
+            return Err(ProtoError::new(
+                ErrorCode::Unauthenticated,
+                "bad proxy credentials",
+            ));
+        }
+        tcp.write_all(&[1, 0]).await.map_err(ioe)?;
+    }
     let mut req = [0u8; 4];
     tcp.read_exact(&mut req).await.map_err(ioe)?;
     let reply = |code: u8| [5, code, 0, 1, 0, 0, 0, 0, 0, 0];
@@ -135,7 +260,12 @@ async fn socks5(op: Opener, mut tcp: TcpStream, via: Option<String>) -> Result<(
 
 const MAX_HEAD: usize = 16 * 1024;
 
-async fn http_connect(op: Opener, tcp: TcpStream, via: Option<String>) -> Result<(), ProtoError> {
+async fn http_connect(
+    op: Opener,
+    tcp: TcpStream,
+    via: Option<String>,
+    auth: Option<Auth>,
+) -> Result<(), ProtoError> {
     let mut r = BufReader::new(tcp);
     let mut line = String::new();
     r.read_line(&mut line).await.map_err(ioe)?;
@@ -170,6 +300,29 @@ async fn http_connect(op: Opener, tcp: TcpStream, via: Option<String>) -> Result
     // Bytes the client sent early (after the headers) must not be lost.
     let early = r.buffer().to_vec();
     let mut tcp = r.into_inner();
+    if let Some(a) = &auth {
+        let ok = headers.iter().any(|h| {
+            h.split_once(':').is_some_and(|(n, v)| {
+                n.trim().eq_ignore_ascii_case("proxy-authorization") && a.check_header(v)
+            })
+        });
+        if !ok {
+            let body = "proxy authentication required (use the credentials printed by `cjs proxy`)\n";
+            let _ = tcp
+                .write_all(
+                    format!(
+                        "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"cjs\"\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            return Err(ProtoError::new(
+                ErrorCode::Unauthenticated,
+                "missing or bad proxy credentials",
+            ));
+        }
+    }
     let (host, port, head) = if method.eq_ignore_ascii_case("CONNECT") {
         match parse_authority(&target, None) {
             Some((h, p)) => (h, p, None),
@@ -341,8 +494,29 @@ mod tests {
 
     #[test]
     fn exports() {
-        let e = export_lines("127.0.0.1:1080");
+        let e = export_lines("127.0.0.1:1080", None);
         assert!(e.contains("export HTTPS_PROXY=http://127.0.0.1:1080"));
         assert!(e.contains("export ALL_PROXY=socks5h://127.0.0.1:1080"));
+        let a = Auth {
+            user: "cjs".into(),
+            pass: "pw".into(),
+        };
+        let e = export_lines("127.0.0.1:1080", Some(&a));
+        assert!(e.contains("export HTTPS_PROXY=http://cjs:pw@127.0.0.1:1080"));
+        assert!(e.contains("export ALL_PROXY=socks5h://cjs:pw@127.0.0.1:1080"));
+    }
+
+    #[test]
+    fn basic_auth() {
+        let a = Auth {
+            user: "cjs".into(),
+            pass: "pw".into(),
+        };
+        let ok = base64::engine::general_purpose::STANDARD.encode("cjs:pw");
+        assert!(a.check_header(&format!(" Basic {ok}\r\n")));
+        let bad = base64::engine::general_purpose::STANDARD.encode("cjs:px");
+        assert!(!a.check_header(&format!("Basic {bad}")));
+        assert!(!a.check_header("Bearer x"));
+        assert!(!a.check(b"cjs", b"pw2"));
     }
 }

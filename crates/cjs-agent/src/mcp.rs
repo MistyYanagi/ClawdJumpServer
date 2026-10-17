@@ -106,7 +106,16 @@ pub async fn read_file(op: &Opener, device: &str, path: &str) -> Result<Vec<u8>,
     let mut data = Vec::new();
     while let Some(m) = read_msg::<_, FileMsg>(&mut s).await? {
         match m {
-            FileMsg::Chunk(b) => data.extend(b),
+            FileMsg::Chunk(b) => {
+                // Don't trust the announced size: bound what we buffer.
+                if (data.len() + b.len()) as u64 > MAX_FILE {
+                    return Err(ProtoError::new(
+                        ErrorCode::LimitExceeded,
+                        format!("file is larger than {MAX_FILE} bytes"),
+                    ));
+                }
+                data.extend(b)
+            }
             FileMsg::End { .. } => return Ok(data),
             _ => return Err(ProtoError::new(ErrorCode::Protocol, "unexpected message")),
         }

@@ -236,6 +236,12 @@ pub async fn download(
     let remote_sha = loop {
         match read_msg::<_, FileMsg>(&mut s).await? {
             Some(FileMsg::Chunk(b)) => {
+                if offset + got + b.len() as u64 > size {
+                    return Err(ProtoError::new(
+                        ErrorCode::Protocol,
+                        "device sent more data than the file size it announced",
+                    ));
+                }
                 f.write_all(&b).await.map_err(ioe)?;
                 got += b.len() as u64;
             }
