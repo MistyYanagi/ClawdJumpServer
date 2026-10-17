@@ -26,6 +26,10 @@ use cjs_proto::{DirEntry, EntryKind, ErrorCode, ProtoError};
 pub struct Root {
     /// Canonical host path of the root.
     path: PathBuf,
+    /// The root as configured (may go through symlinks, e.g. `/tmp` on
+    /// macOS). Accepted as a prefix too; the remainder is still resolved
+    /// beneath `dir`, so it cannot widen access.
+    given: PathBuf,
     dir: Dir,
 }
 
@@ -155,7 +159,11 @@ impl Jail {
             let path = std::fs::canonicalize(r)
                 .map_err(|e| ProtoError::new(ErrorCode::NotFound, format!("project root {r}: {e}")))?;
             let dir = Dir::open_ambient_dir(&path, ambient_authority()).map_err(io_err)?;
-            out.push(Root { path, dir });
+            out.push(Root {
+                path,
+                given: PathBuf::from(r),
+                dir,
+            });
         }
         Ok(Jail::Roots(out))
     }
@@ -199,7 +207,7 @@ impl Jail {
                 }
                 let abs = PathBuf::from(p);
                 for r in roots {
-                    if let Some(rest) = strip_root(&abs, &r.path) {
+                    if let Some(rest) = strip_root(&abs, &r.path).or_else(|| strip_root(&abs, &r.given)) {
                         let rel = clean_rel(&rest)?;
                         return Ok(Resolved {
                             dir: Some(&r.dir),
@@ -494,6 +502,31 @@ mod tests {
         std::fs::write(t.path().join("secret.txt"), b"top secret").unwrap();
         let j = Jail::new(&[root.to_string_lossy().into_owned()], false).unwrap();
         (t, root, j)
+    }
+
+    /// A root configured through a symlink (like `/tmp` -> `/private/tmp`
+    /// on macOS) accepts absolute paths under either spelling, and still
+    /// refuses escapes.
+    #[cfg(unix)]
+    #[test]
+    fn root_given_through_symlink() {
+        let t = tempfile::tempdir().unwrap();
+        let real = t.path().join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        std::fs::write(real.join("sub/a.txt"), "hi").unwrap();
+        std::fs::write(t.path().join("outside.txt"), "no").unwrap();
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let j = Jail::new(&[link.to_string_lossy().into_owned()], false).unwrap();
+        assert!(j.open_read(&link.join("sub/a.txt").to_string_lossy()).is_ok());
+        let canon = std::fs::canonicalize(&real).unwrap();
+        assert!(j.open_read(&canon.join("sub/a.txt").to_string_lossy()).is_ok());
+        assert!(j
+            .open_read(&t.path().join("outside.txt").to_string_lossy())
+            .is_err());
+        assert!(j
+            .open_read(&format!("{}/../outside.txt", link.display()))
+            .is_err());
     }
 
     #[test]
