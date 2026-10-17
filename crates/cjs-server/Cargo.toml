@@ -1,0 +1,51 @@
+[package]
+name = "cjs-server"
+description = "ClawdJumpServer bastion: gateway, 4A, relay with recording, egress proxy, REST API and web UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cjs-proto.workspace = true
+cjs-mux.workspace = true
+cjs-transport.workspace = true
+cjs-authz.workspace = true
+cjs-audit.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+tower-http.workspace = true
+rustls.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+argon2.workspace = true
+totp-rs.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+hex.workspace = true
+sha2.workspace = true
+base64.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+rust-embed.workspace = true
+mime_guess.workspace = true
+subtle.workspace = true
+url.workspace = true
+rcgen.workspace = true
+
+[[bin]]
+name = "cjs-server"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

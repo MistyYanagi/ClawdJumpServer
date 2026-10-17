@@ -1,0 +1,19 @@
+[package]
+name = "cjs-mux"
+description = "Stream multiplexing (yamux) and per-stream message framing for ClawdJumpServer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cjs-proto.workspace = true
+tokio.workspace = true
+tokio-util = { workspace = true, features = ["compat"] }
+serde.workspace = true
+tracing.workspace = true
+yamux.workspace = true
+futures.workspace = true
+
+[lints]
+workspace = true

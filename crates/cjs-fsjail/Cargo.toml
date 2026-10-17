@@ -1,0 +1,17 @@
+[package]
+name = "cjs-fsjail"
+description = "Project-directory jail for device file access (cap-std based)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cap-std.workspace = true
+cjs-proto.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

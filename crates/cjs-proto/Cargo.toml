@@ -1,0 +1,15 @@
+[package]
+name = "cjs-proto"
+description = "ClawdJumpServer wire protocol: frames, handshake payloads, stream kinds, error codes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,121 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cjs-proto",
+    "crates/cjs-mux",
+    "crates/cjs-transport",
+    "crates/cjs-authz",
+    "crates/cjs-audit",
+    "crates/cjs-fsjail",
+    "crates/cjs-sandbox",
+    "crates/cjs-server",
+    "crates/cjs-agent",
+    "crates/cjs-device",
+    "crates/cjs-ctl",
+    "crates/cjs-tests",
+]
+# The Leptos/WASM front-end is built separately with trunk (see crates/cjs-web).
+exclude = ["crates/cjs-web"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/MistyYanagi/ClawdJumpServer"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "allow"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "allow"
+large_enum_variant = "allow"
+too_many_arguments = "allow"
+result_large_err = "allow"
+
+[workspace.dependencies]
+cjs-proto = { path = "crates/cjs-proto" }
+cjs-mux = { path = "crates/cjs-mux" }
+cjs-transport = { path = "crates/cjs-transport" }
+cjs-authz = { path = "crates/cjs-authz" }
+cjs-audit = { path = "crates/cjs-audit" }
+cjs-fsjail = { path = "crates/cjs-fsjail" }
+cjs-sandbox = { path = "crates/cjs-sandbox" }
+cjs-server = { path = "crates/cjs-server" }
+cjs-agent = { path = "crates/cjs-agent" }
+cjs-device = { path = "crates/cjs-device" }
+cjs-ctl = { path = "crates/cjs-ctl" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", default-features = false, features = ["alloc", "use-std"] }
+bytes = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt", "compat", "io", "codec"] }
+tokio-stream = "0.1"
+futures = "0.3"
+yamux = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+async-trait = "0.1"
+snow = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+blake3 = "1"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+axum = { version = "0.8", features = ["ws", "macros"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["set-header"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots", "json", "http2"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "0.26"
+rustls-native-certs = "0.8"
+rcgen = "0.13"
+rusqlite = { version = "0.32", features = ["bundled"] }
+argon2 = { version = "0.5", features = ["std"] }
+totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }
+portable-pty = "0.9"
+cap-std = "4"
+landlock = "0.4"
+rlimit = "0.10"
+clap = { version = "4", features = ["derive", "env"] }
+toml = "0.8"
+rust-embed = { version = "8", features = ["include-exclude"] }
+mime_guess = "2"
+ipnet = "2"
+url = "2"
+dirs = "5"
+crossterm = "0.28"
+rpassword = "7"
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
+humantime = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+cookie = "0.18"
+subtle = "2"
+http = "1"
+http-body-util = "0.1"
+hyper = "1"
+hyper-util = "0.1"
+pin-project-lite = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "symbols"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.snow]
+opt-level = 3

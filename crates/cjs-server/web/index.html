@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ClawdJumpServer</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header id="top" hidden>
+  <strong class="brand">ClawdJumpServer</strong>
+  <nav id="nav"></nav>
+  <span id="who"></span>
+  <button id="logout" type="button">Log out</button>
+</header>
+<main id="main">
+  <section id="login" class="card narrow" hidden>
+    <h1>Sign in</h1>
+    <form id="login-form">
+      <label>User <input name="name" autocomplete="username" required></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+      <label>Authenticator code <input name="totp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" required></label>
+      <button type="submit">Sign in</button>
+      <p class="error" id="login-error"></p>
+    </form>
+  </section>
+  <section id="view"></section>
+</main>
+<div id="toast" role="status"></div>
+</body>
+</html>
