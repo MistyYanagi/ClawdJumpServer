@@ -237,7 +237,7 @@ mod tests {
         let mut r = req(Action::Exec);
         r.principal_groups = &pg;
         r.device_groups = &dg;
-        assert!(decide(&r, &[g.clone()], &[]).allow);
+        assert!(decide(&r, std::slice::from_ref(&g), &[]).allow);
         r.device_groups = &[];
         assert!(!decide(&r, &[g], &[]).allow);
     }
@@ -256,7 +256,7 @@ mod tests {
             end_min: 18 * 60,
             utc_offset_minutes: 0,
         });
-        assert!(!decide(&req(Action::Shell), &[g.clone()], &[]).allow);
+        assert!(!decide(&req(Action::Shell), std::slice::from_ref(&g), &[]).allow);
         g.schedule.as_mut().unwrap().utc_offset_minutes = -10 * 60; // 12:13 local
         assert!(decide(&req(Action::Shell), &[g], &[]).allow);
     }
@@ -266,15 +266,15 @@ mod tests {
         let g = grant(&[Action::ForwardLocal, Action::ForwardRemote]);
         let mut r = req(Action::ForwardLocal);
         r.net = Some(("127.0.0.1", 8080));
-        assert!(decide(&r, &[g.clone()], &[]).allow);
+        assert!(decide(&r, std::slice::from_ref(&g), &[]).allow);
         r.net = Some(("127.0.0.1", 22));
-        assert!(!decide(&r, &[g.clone()], &[]).allow);
+        assert!(!decide(&r, std::slice::from_ref(&g), &[]).allow);
         let mut r = req(Action::ForwardRemote);
         r.net = Some(("127.0.0.1", 9005));
-        assert!(decide(&r, &[g.clone()], &[]).allow);
+        assert!(decide(&r, std::slice::from_ref(&g), &[]).allow);
         r.net = Some(("0.0.0.0", 9005));
         assert!(
-            !decide(&r, &[g.clone()], &[]).allow,
+            !decide(&r, std::slice::from_ref(&g), &[]).allow,
             "non-loopback bind needs full access"
         );
         r.net = Some(("127.0.0.1", 9100));
@@ -323,7 +323,7 @@ mod tests {
         );
         fa.approve("bob", &[Role::Secadmin], Some("carol"), now).unwrap();
         let g = grant(&[Action::Shell]);
-        let d = decide(&req(Action::Shell), &[g.clone()], &[fa.clone()]);
+        let d = decide(&req(Action::Shell), std::slice::from_ref(&g), &[fa.clone()]);
         assert_eq!(d.full_access.as_deref(), Some("f1"));
         let mut r = req(Action::Shell);
         r.now = now + 3601;
