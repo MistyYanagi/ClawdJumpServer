@@ -84,7 +84,7 @@ rustls-native-certs = "0.8"
 rcgen = "0.13"
 rusqlite = { version = "0.32", features = ["bundled"] }
 argon2 = { version = "0.5", features = ["std"] }
-totp-rs = { version = "5", features = ["gen_secret"] }
+totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }
 portable-pty = "0.9"
 cap-std = "4"
 landlock = "0.4"
