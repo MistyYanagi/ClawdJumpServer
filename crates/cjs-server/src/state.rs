@@ -33,6 +33,9 @@ pub struct ServerConfig {
     /// Web session idle timeout and absolute lifetime (seconds).
     pub web_idle_secs: i64,
     pub web_max_secs: i64,
+    /// Size limit of one terminal recording. A session that reaches it is
+    /// terminated (recording is mandatory) and the reason is audited.
+    pub max_recording_bytes: u64,
 }
 
 impl ServerConfig {
@@ -44,6 +47,7 @@ impl ServerConfig {
             secure_cookies: true,
             web_idle_secs: 30 * 60,
             web_max_secs: 12 * 3600,
+            max_recording_bytes: cjs_audit::recording::DEFAULT_MAX_RECORDING,
         }
     }
 }
