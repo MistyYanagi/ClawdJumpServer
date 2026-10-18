@@ -433,6 +433,12 @@ pub const ROUTES: &[(&str, &str, &str, &str)] = &[
         "auditor",
         "Download a terminal recording (asciicast v2)",
     ),
+    (
+        "get",
+        "/api/v1/sessions/{session}/live",
+        "secadmin|auditor",
+        "Watch a terminal session: long-poll for recording events after a byte offset (read-only)",
+    ),
     ("get", "/api/v1/openapi.json", "-", "This document"),
 ];
 
@@ -482,6 +488,7 @@ pub fn router(srv: Server) -> Router {
         .route("/api/v1/audit/export", get(audit_export))
         .route("/api/v1/audit/checkpoint", post(audit_checkpoint))
         .route("/api/v1/recordings/{session}", get(recording))
+        .route("/api/v1/sessions/{session}/live", get(watch_session))
         .route("/api/v1/openapi.json", get(openapi))
         .with_state(srv)
 }
@@ -1669,6 +1676,132 @@ async fn recording(State(srv): State<Server>, auth: Auth, Path(session): Path<St
         data,
     )
         .into_response())
+}
+
+#[derive(Deserialize)]
+struct WatchQuery {
+    /// Byte offset into the recording, as returned by the previous call.
+    after: Option<u64>,
+    /// Long-poll timeout in seconds (0..=25, default 20).
+    wait: Option<u64>,
+}
+
+/// Most recording bytes returned by one watch call.
+const WATCH_CHUNK: u64 = 256 * 1024;
+
+/// (web session, terminal session) pairs whose watch was audited, so a
+/// watcher is audited once rather than on every poll. With `mark`, the
+/// pair is recorded; returns whether it was already known.
+fn watch_seen(token_hash: &str, session: &str, mark: bool) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let key = (token_hash.to_string(), session.to_string());
+    if !mark {
+        return seen.contains(&key);
+    }
+    if seen.len() > 10_000 {
+        seen.clear();
+    }
+    !seen.insert(key)
+}
+
+/// The complete lines of `path` after byte `after` (at most
+/// [`WATCH_CHUNK`] bytes) and the offset just past them.
+async fn read_cast_lines(path: &std::path::Path, after: u64) -> R<(Vec<String>, u64)> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut f = tokio::fs::File::open(path)
+        .await
+        .map_err(|_| ApiError::not_found("no recording for this session"))?;
+    let len = f
+        .metadata()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .len();
+    if after > len {
+        return Err(ApiError::bad("offset beyond the end of the recording"));
+    }
+    f.seek(std::io::SeekFrom::Start(after))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut buf = Vec::new();
+    f.take(WATCH_CHUNK.min(len - after))
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    // Whole lines only: the recorder may be in the middle of one.
+    let end = buf.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    let lines = String::from_utf8_lossy(&buf[..end])
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok((lines, after + end as u64))
+}
+
+/// Read-only live view of a terminal session. The session's asciicast
+/// recording is read from byte `after` on; when nothing new is there and
+/// the session is still open, the call waits up to `wait` seconds. Only
+/// output and resize events are returned: keystrokes can hold secrets and
+/// stay in the (separately audited) recording download. The first watch
+/// of a session per web session is audited as `session.watch`.
+async fn watch_session(
+    State(srv): State<Server>,
+    auth: Auth,
+    Path(session): Path<String>,
+    Query(q): Query<WatchQuery>,
+) -> R<Json<Value>> {
+    auth.require_any(&[Role::Secadmin, Role::Auditor])?;
+    if session.is_empty() || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(ApiError::bad("bad session id"));
+    }
+    let sh = &srv.shared;
+    let path = sh.cfg.recordings_dir.join(format!("{session}.cast"));
+    if !path.is_file() {
+        return Err(ApiError::not_found("no terminal recording for this session"));
+    }
+    let after = q.after.unwrap_or(0);
+    if !watch_seen(&auth.token_hash, &session, false) {
+        sh.audit(
+            auth.event("session.watch", &session)
+                .highlight(true)
+                .session(session.clone())
+                .data(json!({"live": !sh.reg.stream_by_session(&session).is_empty(), "after": after})),
+        )?;
+        watch_seen(&auth.token_hash, &session, true);
+    }
+    let wait = std::time::Duration::from_secs(q.wait.unwrap_or(20).min(25));
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let live = !sh.reg.stream_by_session(&session).is_empty();
+        let (lines, offset) = read_cast_lines(&path, after).await?;
+        if !lines.is_empty() || !live || tokio::time::Instant::now() >= deadline {
+            let mut header = Value::Null;
+            let mut events = Vec::new();
+            for (i, l) in lines.iter().enumerate() {
+                let Ok(v) = serde_json::from_str::<Value>(l) else {
+                    continue;
+                };
+                if after == 0 && i == 0 && v.is_object() {
+                    header = v;
+                } else if matches!(v[1].as_str(), Some("o" | "r")) {
+                    events.push(v);
+                }
+            }
+            return Ok(Json(json!({
+                "session": session,
+                "live": live,
+                "offset": offset,
+                "header": header,
+                "events": events,
+            })));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
