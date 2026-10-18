@@ -476,6 +476,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "blake3",
  "cjs-mux",
  "cjs-proto",
  "cjs-transport",
@@ -517,6 +518,7 @@ dependencies = [
 name = "cjs-authz"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "chrono",
  "cjs-proto",
  "ed25519-dalek",
@@ -531,6 +533,7 @@ dependencies = [
 name = "cjs-ctl"
 version = "0.1.0"
 dependencies = [
+ "cjs-audit",
  "cjs-proto",
  "cjs-transport",
  "clap",
@@ -559,6 +562,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "hex",
+ "nix",
  "portable-pty",
  "rand 0.8.8",
  "serde",
@@ -579,6 +583,7 @@ version = "0.1.0"
 dependencies = [
  "cap-std",
  "cjs-proto",
+ "libc",
  "tempfile",
 ]
 
@@ -609,6 +614,7 @@ name = "cjs-sandbox"
 version = "0.1.0"
 dependencies = [
  "landlock",
+ "nix",
  "rlimit",
  "tempfile",
  "thiserror 2.0.21",
@@ -685,6 +691,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "blake3",
  "bytes",
  "cjs-mux",
  "cjs-proto",

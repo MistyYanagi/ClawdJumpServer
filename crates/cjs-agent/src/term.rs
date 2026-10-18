@@ -12,6 +12,11 @@ use crate::local::Opener;
 /// compromised device must not be able to plant commands in the user's
 /// clipboard. Everything else passes through unchanged. State carries over
 /// chunk boundaries.
+///
+/// Both the 7-bit introducer (`ESC ]`) and the C1 one (`0x9d`, raw or
+/// UTF-8 encoded as `C2 9D`) are recognized, and the numeric parameter is
+/// compared as a number, so `ESC]052;` is caught too. Dropped sequences end
+/// at BEL, `ESC \`, or C1 ST (`0x9c` / `C2 9C`).
 #[derive(Debug, Default)]
 pub struct OutputFilter {
     st: St,
@@ -22,61 +27,108 @@ enum St {
     #[default]
     Normal,
     Esc,
+    /// Saw 0xC2 (possible UTF-8 encoded C1 control).
+    C2,
+    /// Inside an OSC numeric parameter: bytes seen so far (for replay).
     OscNum(Vec<u8>),
     Drop,
     DropEsc,
+    DropC2,
+}
+
+/// Longest numeric OSC parameter we buffer before passing it through.
+const MAX_OSC_NUM: usize = 16;
+
+fn osc_is_52(buf: &[u8], intro_len: usize) -> bool {
+    let digits = &buf[intro_len..];
+    !digits.is_empty()
+        && digits.iter().all(u8::is_ascii_digit)
+        && std::str::from_utf8(digits)
+            .ok()
+            .and_then(|d| d.trim_start_matches('0').parse::<u32>().ok())
+            == Some(52)
 }
 
 impl OutputFilter {
     pub fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) {
         for &b in input {
-            self.st = match std::mem::take(&mut self.st) {
-                St::Normal => {
-                    if b == 0x1b {
-                        St::Esc
-                    } else {
-                        out.push(b);
-                        St::Normal
-                    }
+            self.st = self.step(b, out);
+        }
+    }
+
+    fn step(&mut self, b: u8, out: &mut Vec<u8>) -> St {
+        match std::mem::take(&mut self.st) {
+            St::Normal => self.normal(b, out),
+            St::Esc => match b {
+                b']' => St::OscNum(vec![0x1b, b']']),
+                0x1b => {
+                    out.push(0x1b);
+                    St::Esc
                 }
-                St::Esc => match b {
-                    b']' => St::OscNum(vec![0x1b, b']']),
-                    0x1b => {
-                        out.push(0x1b);
-                        St::Esc
-                    }
-                    _ => {
-                        out.extend_from_slice(&[0x1b, b]);
-                        St::Normal
-                    }
-                },
-                St::OscNum(mut buf) => {
-                    if b.is_ascii_digit() && buf.len() < 16 {
-                        buf.push(b);
-                        St::OscNum(buf)
-                    } else if b == b';' && &buf[2..] == b"52" {
-                        St::Drop
-                    } else {
-                        out.extend_from_slice(&buf);
-                        if b == 0x1b {
-                            St::Esc
-                        } else {
-                            out.push(b);
-                            St::Normal
-                        }
-                    }
+                _ => {
+                    out.extend_from_slice(&[0x1b, b]);
+                    St::Normal
                 }
-                St::Drop => match b {
-                    0x07 => St::Normal,
-                    0x1b => St::DropEsc,
-                    _ => St::Drop,
-                },
-                St::DropEsc => match b {
-                    b'\\' => St::Normal,
-                    0x1b => St::DropEsc,
-                    _ => St::Drop,
-                },
-            };
+            },
+            St::C2 => {
+                if b == 0x9d {
+                    St::OscNum(vec![0xc2, 0x9d])
+                } else {
+                    out.push(0xc2);
+                    self.normal(b, out)
+                }
+            }
+            St::OscNum(mut buf) => {
+                let intro = if buf[0] == 0x1b || buf[0] == 0xc2 { 2 } else { 1 };
+                if b.is_ascii_digit() && buf.len() < intro + MAX_OSC_NUM {
+                    buf.push(b);
+                    St::OscNum(buf)
+                } else if b == b';' && osc_is_52(&buf, intro) {
+                    St::Drop
+                } else {
+                    out.extend_from_slice(&buf);
+                    self.normal(b, out)
+                }
+            }
+            St::Drop => match b {
+                0x07 | 0x9c => St::Normal,
+                0x1b => St::DropEsc,
+                0xc2 => St::DropC2,
+                _ => St::Drop,
+            },
+            St::DropEsc => match b {
+                b'\\' => St::Normal,
+                0x1b => St::DropEsc,
+                _ => St::Drop,
+            },
+            St::DropC2 => match b {
+                0x9c => St::Normal,
+                0xc2 => St::DropC2,
+                0x1b => St::DropEsc,
+                _ => St::Drop,
+            },
+        }
+    }
+
+    fn normal(&mut self, b: u8, out: &mut Vec<u8>) -> St {
+        match b {
+            0x1b => St::Esc,
+            0x9d => St::OscNum(vec![0x9d]),
+            0xc2 => St::C2,
+            _ => {
+                out.push(b);
+                St::Normal
+            }
+        }
+    }
+
+    /// Flush bytes held back while looking for a sequence (at end of output).
+    pub fn finish(&mut self, out: &mut Vec<u8>) {
+        match std::mem::take(&mut self.st) {
+            St::Esc => out.push(0x1b),
+            St::C2 => out.push(0xc2),
+            St::OscNum(buf) => out.extend_from_slice(&buf),
+            _ => {}
         }
     }
 }
@@ -211,5 +263,26 @@ mod tests {
         assert_eq!(run(&[b"\x1b]0;title\x07x"]), b"\x1b]0;title\x07x");
         assert_eq!(run(&[b"\x1b[31mred\x1b[0m"]), b"\x1b[31mred\x1b[0m");
         assert_eq!(run(&[b"\x1b]521;x\x07"]), b"\x1b]521;x\x07");
+    }
+
+    #[test]
+    fn catches_variant_encodings() {
+        // Leading zeros.
+        assert_eq!(run(&[b"a\x1b]052;c;Zm9v\x07b"]), b"ab");
+        assert_eq!(run(&[b"a\x1b]0052;c;Zm9v\x1b\\b"]), b"ab");
+        // Raw C1 OSC and C1 ST.
+        assert_eq!(run(&[b"a\x9d52;c;Zm9v\x9cb"]), b"ab");
+        // UTF-8 encoded C1 OSC / ST, split across chunks.
+        assert_eq!(run(&[b"a\xc2", b"\x9d52;c;Zm9v\xc2", b"\x9cb"]), b"ab");
+        // Ordinary UTF-8 using a C2 lead byte passes through.
+        assert_eq!(run(&["x\u{a2}y".as_bytes()]), "x\u{a2}y".as_bytes());
+        // OSC 0 via C1 passes.
+        assert_eq!(run(&[b"\x9d0;t\x07"]), b"\x9d0;t\x07");
+        // Held-back bytes are flushed at the end.
+        let mut f = OutputFilter::default();
+        let mut out = Vec::new();
+        f.feed(b"z\x1b]5", &mut out);
+        f.finish(&mut out);
+        assert_eq!(out, b"z\x1b]5");
     }
 }

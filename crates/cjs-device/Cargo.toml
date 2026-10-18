@@ -35,6 +35,9 @@ ed25519-dalek.workspace = true
 dirs.workspace = true
 url.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.28", features = ["signal"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 

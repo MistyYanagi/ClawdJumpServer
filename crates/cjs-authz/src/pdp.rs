@@ -28,7 +28,8 @@ pub struct Decision {
     pub grant_ids: Vec<String>,
     pub roots: Vec<String>,
     pub full_access: Option<String>,
-    /// Egress rules of the matching grants, for the post-DNS IP check.
+    /// Network rules of the matching grants (`egress`, or `forward_targets`
+    /// for local forwards), for the post-DNS IP check.
     pub egress_rules: Vec<net::NetRule>,
 }
 
@@ -141,7 +142,8 @@ pub fn decide(req: &AccessRequest, grants: &[Grant], full: &[FullAccess]) -> Dec
             }
         }
     }
-    if req.device.is_some() && roots.is_empty() && full_access.is_none() {
+    // Egress through a device exits to the network and never touches files.
+    if req.device.is_some() && req.action != Action::Egress && roots.is_empty() && full_access.is_none() {
         return Decision::deny(ErrorCode::Forbidden, "grant has no project roots");
     }
     Decision {
@@ -158,7 +160,13 @@ pub fn decide(req: &AccessRequest, grants: &[Grant], full: &[FullAccess]) -> Dec
         grant_ids: with_room.iter().map(|g| g.id.clone()).collect(),
         roots,
         full_access,
-        egress_rules: with_room.iter().flat_map(|g| g.egress.clone()).collect(),
+        egress_rules: with_room
+            .iter()
+            .flat_map(|g| match req.action {
+                Action::ForwardLocal => g.forward_targets.clone(),
+                _ => g.egress.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -345,7 +353,7 @@ mod tests {
             approved_by: None,
             decided_at: None,
             expires_at: None,
-            created_at: 0,
+            created_at: 1_700_000_000 - 60,
         };
         let now = 1_700_000_000;
         assert!(

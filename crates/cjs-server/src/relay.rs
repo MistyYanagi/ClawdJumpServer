@@ -217,12 +217,15 @@ async fn open_and_relay(
 ) -> Result<(), ProtoError> {
     let session = new_id("s");
     let stream_id = sh.next_stream_id();
-    let (dec, device) = sh.decide(p, &req, None).map_err(|e| e.proto())?;
+    // Decision and concurrency slot are taken atomically; the slot is
+    // released when this function returns (the registered stream then
+    // counts until it ends).
+    let (dec, device, _slot) = sh.decide_and_reserve(p, &req, stream_id).map_err(|e| e.proto())?;
     let target = device
         .as_ref()
         .map(|d| d.id.clone())
         .unwrap_or_else(|| req.net_target().unwrap_or_else(|| "server".into()));
-    sh.audit(
+    sh.audit_async(
         Event::new(
             "authz.decision",
             &p.id,
@@ -247,6 +250,7 @@ async fn open_and_relay(
             "full_access": dec.full_access,
         })),
     )
+    .await
     .map_err(|e| e.proto())?;
     if !dec.allow {
         return Err(perr(dec.code.unwrap_or(ErrorCode::Forbidden), dec.reason));
@@ -296,8 +300,9 @@ async fn open_and_relay(
         connection: dconn.id.clone(),
         target: req.net_target(),
         session: session.clone(),
+        req_hash: capability::request_hash(&req.for_device()),
         net_rules: match req {
-            OpenRequest::Egress { .. } => Some(
+            OpenRequest::Egress { .. } | OpenRequest::ForwardL { .. } => Some(
                 serde_json::to_string(&dec.egress_rules)
                     .map_err(|e| perr(ErrorCode::Internal, e.to_string()))?,
             ),
@@ -319,12 +324,13 @@ async fn open_and_relay(
     let device_ref = match dreply {
         OpenReply::Ok { id, .. } => id,
         OpenReply::Err(e) => {
-            let _ = sh.audit(
+            let _ = sh.audit_async(
                 Event::new("session.fail", &p.id, &target, Outcome::Failure)
                     .session(session.clone())
                     .ip(conn.peer.clone())
                     .data(json!({"kind": req.kind().as_str(), "code": e.code.as_str(), "reason": e.message})),
-            );
+            )
+        .await;
             return Err(e);
         }
     };
@@ -336,7 +342,8 @@ async fn open_and_relay(
             let title = format!("{} @ {}", p.name, device.name);
             Some(
                 Recorder::create(&path, *cols, *rows, &title)
-                    .map_err(|e| perr(ErrorCode::AuditFailure, format!("cannot record session: {e}")))?,
+                    .map_err(|e| perr(ErrorCode::AuditFailure, format!("cannot record session: {e}")))?
+                    .with_limit(sh.cfg.max_recording_bytes),
             )
         }
         _ => None,
@@ -355,7 +362,7 @@ async fn open_and_relay(
         conn.peer.clone(),
     ));
     let _g = sh.reg.add_stream(info.clone());
-    sh.audit(
+    sh.audit_async(
         Event::new("session.start", &p.id, &target, Outcome::Success)
             .session(session.clone())
             .ip(conn.peer.clone())
@@ -370,6 +377,7 @@ async fn open_and_relay(
                 "transport": conn.transport,
             })),
     )
+    .await
     .map_err(|e| e.proto())?;
     write_msg(
         s,
@@ -421,13 +429,16 @@ async fn open_and_relay(
         ),
     };
     stats["error"] = err;
-    if let Err(e) = sh.audit(
-        Event::new("session.end", &p.id, &target, outcome)
-            .session(session.clone())
-            .ip(conn.peer.clone())
-            .highlight(dec.full_access.is_some())
-            .data(stats),
-    ) {
+    if let Err(e) = sh
+        .audit_async(
+            Event::new("session.end", &p.id, &target, outcome)
+                .session(session.clone())
+                .ip(conn.peer.clone())
+                .highlight(dec.full_access.is_some())
+                .data(stats),
+        )
+        .await
+    {
         tracing::error!(%session, err = %e, "could not audit session end");
     }
     result
@@ -494,11 +505,14 @@ pub(crate) async fn device_stream(sh: Arc<Shared>, dconn: Arc<ConnInfo>, mut s: 
         Ok(a) => a,
         Err(e) => return reply_err(&mut s, e).await,
     };
-    if let Err(e) = sh.audit(
-        Event::new("forward.conn", &reg.principal, &reg.device, Outcome::Success)
-            .session(reg.session.clone())
-            .data(json!({"stream": id, "listener": reg.agent_listener, "peer": peer})),
-    ) {
+    if let Err(e) = sh
+        .audit_async(
+            Event::new("forward.conn", &reg.principal, &reg.device, Outcome::Success)
+                .session(reg.session.clone())
+                .data(json!({"stream": id, "listener": reg.agent_listener, "peer": peer})),
+        )
+        .await
+    {
         return reply_err(&mut s, e.proto()).await;
     }
     if write_msg(
@@ -515,25 +529,27 @@ pub(crate) async fn device_stream(sh: Arc<Shared>, dconn: Arc<ConnInfo>, mut s: 
     }
     let started = Instant::now();
     let (r, down, up) = relay_raw(&mut s, &mut a, &reg.cancel).await;
-    let _ = sh.audit(
-        Event::new(
-            "forward.conn_end",
-            &reg.principal,
-            &reg.device,
-            if r.is_ok() {
-                Outcome::Success
-            } else {
-                Outcome::Failure
-            },
+    let _ = sh
+        .audit_async(
+            Event::new(
+                "forward.conn_end",
+                &reg.principal,
+                &reg.device,
+                if r.is_ok() {
+                    Outcome::Success
+                } else {
+                    Outcome::Failure
+                },
+            )
+            .session(reg.session.clone())
+            .data(json!({
+                "stream": id,
+                "bytes_to_agent": down,
+                "bytes_to_device": up,
+                "duration_ms": started.elapsed().as_millis() as u64,
+            })),
         )
-        .session(reg.session.clone())
-        .data(json!({
-            "stream": id,
-            "bytes_to_agent": down,
-            "bytes_to_device": up,
-            "duration_ms": started.elapsed().as_millis() as u64,
-        })),
-    );
+        .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -547,11 +563,14 @@ fn cancelled(info: &StreamInfo) -> ProtoError {
 /// Relay typed messages. `on_in` inspects agent -> device messages,
 /// `on_out` device -> agent messages and returns true for the final one.
 /// On error or cancellation `abort` builds the messages sent to the agent
-/// before the stream is closed.
+/// before the stream is closed, and `stop_dev` (if any) is sent to the
+/// device so it ends the session's processes instead of only seeing the
+/// stream close (which, for exec, merely ends stdin).
 async fn relay_typed<I, O, FI, FO, FA>(
     agent: &mut MuxStream,
     dev: &mut MuxStream,
     info: &StreamInfo,
+    stop_dev: Option<I>,
     mut on_in: FI,
     mut on_out: FO,
     abort: FA,
@@ -615,6 +634,9 @@ where
         }
     };
     if let Err(e) = &result {
+        if let Some(m) = &stop_dev {
+            let _ = tokio::time::timeout(Duration::from_secs(2), write_msg(&mut dw, m)).await;
+        }
         for m in abort(e) {
             if write_msg(&mut aw, &m).await.is_err() {
                 break;
@@ -627,6 +649,12 @@ where
 }
 
 fn rec_err(e: std::io::Error) -> ProtoError {
+    if cjs_audit::recording::is_limit_error(&e) {
+        return perr(
+            ErrorCode::LimitExceeded,
+            format!("session terminated: {e} (recording is mandatory)"),
+        );
+    }
     perr(ErrorCode::AuditFailure, format!("session recording failed: {e}"))
 }
 
@@ -647,6 +675,7 @@ async fn relay_pty(
         agent,
         dev,
         info,
+        None,
         |m| {
             let mut rec = rec.lock().unwrap_or_else(|p| p.into_inner());
             match m {
@@ -718,6 +747,7 @@ async fn relay_exec(
         agent,
         dev,
         info,
+        Some(ExecIn::Kill),
         |m| {
             if let ExecIn::Stdin(b) = m {
                 stdin += b.len() as u64;
@@ -778,22 +808,46 @@ async fn relay_file_get(
     dev: &mut MuxStream,
     info: &StreamInfo,
 ) -> (Result<(), ProtoError>, Value) {
+    let offset = match &info.req {
+        OpenRequest::FileGet { offset, .. } => *offset,
+        _ => 0,
+    };
     let mut bytes = 0u64;
     let mut h = Sha256::new();
     let mut meta = Value::Null;
+    // Bytes the device may still send: the size it declared in `Meta`
+    // minus the requested offset. `None` until `Meta` arrived.
+    let mut allowed: Option<u64> = None;
     let mut end = Value::Null;
     let r = relay_typed::<FileMsg, FileMsg, _, _, _>(
         agent,
         dev,
         info,
+        None,
         no_input,
         |m| match m {
-            FileMsg::Meta { size, mode, mtime } => {
+            FileMsg::Meta { size, mode, mtime } if allowed.is_none() => {
+                if offset > *size {
+                    return Err(perr(
+                        ErrorCode::Protocol,
+                        "device announced a size below the offset",
+                    ));
+                }
                 meta = json!({"size": size, "mode": mode, "mtime": mtime});
+                allowed = Some(size - offset);
                 Ok(false)
             }
             FileMsg::Chunk(b) => {
+                let Some(limit) = allowed else {
+                    return Err(perr(ErrorCode::Protocol, "file data before metadata"));
+                };
                 bytes += b.len() as u64;
+                if bytes > limit {
+                    return Err(perr(
+                        ErrorCode::Protocol,
+                        "device sent more data than the size it declared",
+                    ));
+                }
                 h.update(b);
                 Ok(false)
             }
@@ -831,6 +885,7 @@ async fn relay_file_put(
         agent,
         dev,
         info,
+        None,
         |m| match m {
             FileMsg::Chunk(b) if !ended => {
                 bytes += b.len() as u64;
@@ -872,6 +927,7 @@ async fn relay_file_list(
         agent,
         dev,
         info,
+        None,
         no_input,
         |m| match m {
             FileMsg::Stat(_) => Ok(false),
@@ -964,4 +1020,104 @@ async fn hold_control(
     let _ = agent.shutdown().await;
     let _ = dev.shutdown().await;
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two connected mux stream pairs: (agent side of the relay, the
+    /// agent's peer end) and (device side of the relay, the device's end).
+    async fn pair() -> (MuxStream, MuxStream) {
+        let (a, b) = tokio::io::duplex(256 * 1024);
+        let (h, _ain, _t) = cjs_mux::spawn(a, cjs_mux::Mode::Client);
+        let (_h2, mut bin, _t2) = cjs_mux::spawn(b, cjs_mux::Mode::Server);
+        let mut s = h.open().await.unwrap();
+        write_msg(&mut s, &0u8).await.unwrap();
+        let mut peer = bin.recv().await.unwrap();
+        let _: u8 = expect_msg(&mut peer).await.unwrap();
+        // Keep the mux drivers alive for the test's duration.
+        std::mem::forget((h, _h2, _ain));
+        (s, peer)
+    }
+
+    fn info(offset: u64) -> StreamInfo {
+        let dec = cjs_authz::Decision {
+            allow: true,
+            code: None,
+            reason: String::new(),
+            grant_ids: vec![],
+            roots: vec![],
+            full_access: None,
+            egress_rules: vec![],
+        };
+        StreamInfo::new(
+            1,
+            "s".into(),
+            OpenRequest::FileGet {
+                device: "d".into(),
+                path: "f".into(),
+                offset,
+            },
+            "p".into(),
+            Some("d".into()),
+            "c".into(),
+            None,
+            &dec,
+            "d".into(),
+            None,
+        )
+    }
+
+    async fn run_get(offset: u64, size: u64, chunks: Vec<Vec<u8>>) -> (Result<(), ProtoError>, u64) {
+        let (mut relay_agent, mut agent) = pair().await;
+        let (mut relay_dev, mut dev) = pair().await;
+        let device = tokio::spawn(async move {
+            let _ = write_msg(
+                &mut dev,
+                &FileMsg::Meta {
+                    size,
+                    mode: 0o644,
+                    mtime: 0,
+                },
+            )
+            .await;
+            for c in chunks {
+                if write_msg(&mut dev, &FileMsg::Chunk(c)).await.is_err() {
+                    return;
+                }
+            }
+            let _ = write_msg(&mut dev, &FileMsg::End { sha256: None }).await;
+        });
+        let reader = tokio::spawn(async move {
+            let mut got = 0u64;
+            while let Ok(Some(m)) = read_msg::<_, FileMsg>(&mut agent).await {
+                if let FileMsg::Chunk(b) = m {
+                    got += b.len() as u64;
+                }
+            }
+            got
+        });
+        let i = info(offset);
+        let (r, _) = relay_file_get(&mut relay_agent, &mut relay_dev, &i).await;
+        drop(relay_agent);
+        let got = reader.await.unwrap();
+        device.abort();
+        (r, got)
+    }
+
+    #[tokio::test]
+    async fn file_get_within_declared_size_passes() {
+        let (r, got) = run_get(4, 10, vec![vec![1; 3], vec![2; 3]]).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(got, 6);
+    }
+
+    #[tokio::test]
+    async fn file_get_overflow_is_cut() {
+        // Declares 10 bytes (6 after the offset) but sends far more.
+        let (r, got) = run_get(4, 10, vec![vec![1; 5], vec![2; 5], vec![3; 1 << 16]]).await;
+        assert_eq!(r.unwrap_err().code, ErrorCode::Protocol);
+        assert!(got <= 6, "agent received {got} bytes beyond the declared size");
+    }
 }

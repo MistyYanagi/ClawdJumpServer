@@ -30,6 +30,16 @@ async fn dial(addrs: &[SocketAddr]) -> Result<TcpStream, ProtoError> {
     Err(last)
 }
 
+/// Network rules the server signed into the capability (fail closed).
+fn signed_rules(cap: &Capability) -> Result<Vec<NetRule>, ProtoError> {
+    cap.net_rules
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| perr(ErrorCode::Forbidden, "capability carries malformed network rules"))?
+        .ok_or_else(|| perr(ErrorCode::Forbidden, "capability carries no network rules"))
+}
+
 async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, ProtoError> {
     let host = host.trim_matches(|c| c == '[' || c == ']');
     Ok(
@@ -55,8 +65,23 @@ pub(crate) async fn forward_local(
     let OpenRequest::ForwardL { host, port, .. } = req else {
         return Err(perr(ErrorCode::BadRequest, "not a forward request"));
     };
-    // The capability already pins host:port (verified by CapVerifier).
-    let mut tcp = dial(&resolve(host, *port).await?).await?;
+    // The capability already pins host:port (verified by CapVerifier); the
+    // resolved addresses are checked against the signed forward rules so a
+    // `*` rule or an alternate spelling cannot reach metadata endpoints or
+    // addresses a deny rule names.
+    let rules = signed_rules(cap)?;
+    let addrs: Vec<SocketAddr> = resolve(host, *port)
+        .await?
+        .into_iter()
+        .filter(|a| cjs_authz::net::forward_ip_allowed(&rules, &a.ip(), *port))
+        .collect();
+    if addrs.is_empty() {
+        return Err(perr(
+            ErrorCode::Forbidden,
+            format!("{host} resolves only to addresses that are not allowed"),
+        ));
+    }
+    let mut tcp = dial(&addrs).await?;
     reply_ok(s, 0, cap).await?;
     *replied = true;
     splice(s, &mut tcp).await;
@@ -73,13 +98,7 @@ pub(crate) async fn egress(
         return Err(perr(ErrorCode::BadRequest, "not an egress request"));
     };
     // Post-DNS SSRF check with the rules the server signed into the token.
-    let rules: Vec<NetRule> = cap
-        .net_rules
-        .as_deref()
-        .map(serde_json::from_str)
-        .transpose()
-        .map_err(|_| perr(ErrorCode::Forbidden, "capability carries malformed network rules"))?
-        .ok_or_else(|| perr(ErrorCode::Forbidden, "capability carries no network rules"))?;
+    let rules = signed_rules(cap)?;
     let addrs: Vec<SocketAddr> = resolve(host, *port)
         .await?
         .into_iter()

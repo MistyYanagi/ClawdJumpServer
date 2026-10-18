@@ -38,9 +38,6 @@ pub(crate) async fn run(
     let jail = Jail::new(&cap.roots, cap.full_access)?;
     let cwd = jail.cwd(cwd.as_deref())?;
     let scratch = scratch_dir(&ctx.opts.dir, &cap.session)?;
-    let argv = command.clone().unwrap_or_else(default_shell);
-    let argv = sandboxed_argv(ctx, cap, &jail, &scratch, argv)?;
-
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: *rows,
@@ -49,6 +46,13 @@ pub(crate) async fn run(
             pixel_height: 0,
         })
         .map_err(pe)?;
+    // Only this session's terminal is writable inside the sandbox.
+    #[cfg(unix)]
+    let tty = pair.master.tty_name();
+    #[cfg(not(unix))]
+    let tty: Option<std::path::PathBuf> = None;
+    let argv = command.clone().unwrap_or_else(default_shell);
+    let argv = sandboxed_argv(ctx, cap, &jail, &scratch, tty, argv)?;
     let mut cmd = CommandBuilder::new(&argv[0]);
     cmd.args(&argv[1..]);
     cmd.cwd(&cwd);

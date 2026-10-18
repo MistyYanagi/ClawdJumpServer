@@ -5,7 +5,8 @@
 //! token itself (signature, device, connection, stream, action, network
 //! target, expiry, replay), so a compromised or bypassed relay cannot widen
 //! access. Shells and commands run inside the OS sandbox (writes limited to
-//! the project roots and a private scratch directory) with a minimal
+//! the project roots and a private scratch directory; the device's own
+//! configuration directory is not even readable) with a minimal
 //! environment; file access goes through the project-root jail.
 #![forbid(unsafe_code)]
 
@@ -54,6 +55,7 @@ pub(crate) fn perr(code: ErrorCode, m: impl Into<String>) -> ProtoError {
 
 /// Connect and serve until the process is stopped. Reconnects with backoff.
 pub async fn run(opts: DeviceOptions) -> Result<(), ProtoError> {
+    tighten_permissions(&opts.dir);
     let profile = Profile::load(&opts.dir)?;
     let key = Profile::key(&opts.dir)?;
     let cfg = profile.client_config(key)?;
@@ -219,6 +221,27 @@ async fn fail(s: &mut MuxStream, e: ProtoError) {
     let _ = s.shutdown().await;
 }
 
+/// Re-apply private permissions to the configuration directory and the
+/// files directly in it (identity key, profile) on every start, in case
+/// they were loosened since enrollment.
+pub(crate) fn tighten_permissions(dir: &Path) {
+    cjs_transport::profile::restrict_dir(dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    let p = e.path();
+                    if let Err(err) = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)) {
+                        tracing::warn!(path = %p.display(), %err, "could not restrict permissions");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Default configuration directory.
 pub fn default_dir() -> PathBuf {
     #[cfg(unix)]
@@ -309,6 +332,7 @@ pub(crate) fn sandboxed_argv(
     cap: &Capability,
     jail: &cjs_fsjail::Jail,
     scratch: &Path,
+    tty: Option<PathBuf>,
     argv: Vec<String>,
 ) -> Result<Vec<String>, ProtoError> {
     if cap.full_access {
@@ -320,6 +344,14 @@ pub(crate) fn sandboxed_argv(
     let policy = cjs_sandbox::Policy {
         write_roots: jail.roots(),
         temp_dir: Some(scratch.to_path_buf()),
+        // The device's identity key, profile and other sessions' scratch
+        // directories must not be readable from inside the sandbox.
+        hidden: vec![ctx.opts.dir.clone()],
+        // Network goes through the server's egress policy (`cjs proxy`,
+        // forwards); direct TCP needs full access.
+        net: false,
+        tty,
+        max_open_files: None,
     };
     cjs_sandbox::wrap(&ctx.opts.helper, &policy, &argv)
         .map_err(|e| perr(ErrorCode::SandboxUnavailable, e.to_string()))

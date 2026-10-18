@@ -53,7 +53,7 @@ impl Profile {
 
     pub fn save(&self, dir: &Path) -> Result<(), ProtoError> {
         std::fs::create_dir_all(dir).map_err(|e| ProtoError::new(ErrorCode::Io, e.to_string()))?;
-        restrict_dir(dir);
+        try_restrict_dir(dir)?;
         let s = toml::to_string_pretty(self).map_err(|e| bad(e.to_string()))?;
         write_secret_file(&dir.join(PROFILE_FILE), s.as_bytes())
     }
@@ -80,16 +80,26 @@ impl Profile {
     }
 }
 
-/// Best effort: make a config directory private to the current user.
-pub fn restrict_dir(dir: &Path) {
+/// Make a config directory private to the current user (mode 0700).
+pub fn try_restrict_dir(dir: &Path) -> Result<(), ProtoError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| ProtoError::new(ErrorCode::Io, format!("{}: {e}", dir.display())))?;
     }
     #[cfg(not(unix))]
     {
         let _ = dir;
+    }
+    Ok(())
+}
+
+/// Like [`try_restrict_dir`], but only logs a failure (for callers that
+/// cannot propagate errors).
+pub fn restrict_dir(dir: &Path) {
+    if let Err(e) = try_restrict_dir(dir) {
+        tracing::warn!(err = %e, "cannot restrict directory permissions");
     }
 }
 
@@ -111,7 +121,7 @@ pub async fn enroll(
         None => None,
     };
     std::fs::create_dir_all(dir).map_err(|e| ProtoError::new(ErrorCode::Io, e.to_string()))?;
-    restrict_dir(dir);
+    try_restrict_dir(dir)?;
     let key = StaticKeypair::load_or_create(&dir.join(KEY_FILE))?;
     let mut server = server.trim().to_string();
     if !server.ends_with('/') {

@@ -242,11 +242,20 @@ impl Jail {
     pub fn open_read(&self, p: &str) -> Result<std::fs::File, ProtoError> {
         let r = self.resolve(p)?;
         let f = match r.dir {
-            Some(d) => d.open(&r.rel).map_err(io_err)?.into_std(),
+            Some(d) => {
+                let mut o = OpenOptions::new();
+                o.read(true);
+                no_block(&mut o);
+                d.open_with(&r.rel, &o).map_err(io_err)?.into_std()
+            }
             None => std::fs::File::open(&r.rel).map_err(io_err)?,
         };
-        if f.metadata().map_err(io_err)?.is_dir() {
+        let m = f.metadata().map_err(io_err)?;
+        if m.is_dir() {
             return Err(ProtoError::new(ErrorCode::BadRequest, "is a directory"));
+        }
+        if r.dir.is_some() {
+            check_plain_file(&m)?;
         }
         Ok(f)
     }
@@ -268,9 +277,17 @@ impl Jail {
                         d.create_dir_all(parent).map_err(io_err)?;
                     }
                 }
+                // Truncate only after checking what was opened: a hard link
+                // to a file outside the roots must not be emptied.
                 let mut o = OpenOptions::new();
-                o.write(true).create(true).truncate(truncate);
-                Ok(d.open_with(&r.rel, &o).map_err(io_err)?.into_std())
+                o.write(true).create(true);
+                no_block(&mut o);
+                let f = d.open_with(&r.rel, &o).map_err(io_err)?.into_std();
+                check_plain_file(&f.metadata().map_err(io_err)?)?;
+                if truncate {
+                    f.set_len(0).map_err(io_err)?;
+                }
+                Ok(f)
             }
             None => {
                 if mkdirs {
@@ -506,6 +523,38 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Open without blocking, so a FIFO (or other special file) planted in a
+/// project root cannot hang the device's runtime; [`check_plain_file`]
+/// then refuses it. No effect on regular files.
+fn no_block(o: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = o;
+    }
+}
+
+/// Jailed file transfers only touch regular files with a single link: a
+/// hard link inside a root may point at a file outside it (for example one
+/// left behind during an approved full-access window).
+fn check_plain_file(m: &std::fs::Metadata) -> Result<(), ProtoError> {
+    if !m.is_file() {
+        return Err(forbidden("not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if m.nlink() > 1 {
+            return Err(forbidden("file has more than one hard link"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,6 +593,41 @@ mod tests {
         assert!(j
             .open_read(&format!("{}/../outside.txt", link.display()))
             .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifos_and_hard_links_are_refused() {
+        let (t, root, j) = setup();
+        let fifo = root.join("ff");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let start = std::time::Instant::now();
+        assert!(j.open_read("ff").is_err(), "fifo read refused");
+        assert!(j.open_write("ff", false, false).is_err(), "fifo write refused");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "did not block"
+        );
+        std::fs::hard_link(t.path().join("secret.txt"), root.join("hl")).unwrap();
+        assert!(j.open_read("hl").is_err(), "hard link read refused");
+        assert!(
+            j.open_write("hl", true, false).is_err(),
+            "hard link write refused"
+        );
+        assert_eq!(
+            std::fs::read(t.path().join("secret.txt")).unwrap(),
+            b"top secret",
+            "not truncated"
+        );
+        // Ordinary files still work, including truncating writes.
+        let mut f = j.open_write("sub/a.txt", true, false).unwrap();
+        f.write_all(b"new").unwrap();
+        drop(f);
+        assert_eq!(std::fs::read(root.join("sub/a.txt")).unwrap(), b"new");
     }
 
     #[test]

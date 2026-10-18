@@ -40,6 +40,23 @@ fn spawn_reader<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     })
 }
 
+/// Ask the process to stop. The sandbox helper then kills everything the
+/// command started; it gets a grace period before SIGKILL ([`KILL_GRACE`]).
+fn terminate(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(id) = child.id() {
+            use nix::sys::signal::{kill, Signal};
+            if kill(nix::unistd::Pid::from_raw(id as i32), Signal::SIGTERM).is_ok() {
+                return;
+            }
+        }
+    }
+    let _ = child.start_kill();
+}
+
+const KILL_GRACE: Duration = Duration::from_secs(3);
+
 #[cfg(unix)]
 fn signal_of(st: &std::process::ExitStatus) -> Option<String> {
     use std::os::unix::process::ExitStatusExt;
@@ -75,7 +92,7 @@ pub(crate) async fn run(
     let jail = Jail::new(&cap.roots, cap.full_access)?;
     let cwd = jail.cwd(cwd.as_deref())?;
     let scratch = scratch_dir(&ctx.opts.dir, &cap.session)?;
-    let full = sandboxed_argv(ctx, cap, &jail, &scratch, argv.clone())?;
+    let full = sandboxed_argv(ctx, cap, &jail, &scratch, None, argv.clone())?;
     let mut cmd = Command::new(&full[0]);
     cmd.args(&full[1..])
         .current_dir(&cwd)
@@ -109,6 +126,8 @@ pub(crate) async fn run(
     let mut timed_out = false;
     let mut status = None;
     let mut outputs_open = true;
+    // Set once we asked the process to stop; SIGKILL follows after the grace.
+    let mut kill_at: Option<tokio::time::Instant> = None;
     let res: Result<(), ProtoError> = loop {
         if status.is_some() && !outputs_open {
             break Ok(());
@@ -130,12 +149,14 @@ pub(crate) async fn run(
                     }
                 }
                 Ok(Some(ExecIn::Kill)) => {
-                    let _ = child.start_kill();
+                    terminate(&mut child);
+                    kill_at.get_or_insert(tokio::time::Instant::now() + KILL_GRACE);
                 }
                 Err(_) => {
                     // Stream broken: the agent is gone.
                     input_open = false;
-                    let _ = child.start_kill();
+                    terminate(&mut child);
+                    kill_at.get_or_insert(tokio::time::Instant::now() + KILL_GRACE);
                 }
             },
             o = rx.recv(), if outputs_open => match o {
@@ -145,7 +166,6 @@ pub(crate) async fn run(
                         Out::Stderr(b) => ExecOut::Stderr(b),
                     };
                     if let Err(e) = write_msg(&mut w, &m).await {
-                        let _ = child.start_kill();
                         break Err(e);
                     }
                 }
@@ -170,7 +190,12 @@ pub(crate) async fn run(
             },
             _ = &mut timeout, if !timed_out => {
                 timed_out = true;
+                terminate(&mut child);
+                kill_at.get_or_insert(tokio::time::Instant::now() + KILL_GRACE);
+            }
+            _ = async { tokio::time::sleep_until(kill_at.expect("guarded")).await }, if kill_at.is_some() && status.is_none() => {
                 let _ = child.start_kill();
+                kill_at = None;
             }
         }
     };
@@ -179,8 +204,14 @@ pub(crate) async fn run(
     let status = match status {
         Some(s) => Some(s),
         None => {
-            let _ = child.start_kill();
-            child.wait().await.ok()
+            terminate(&mut child);
+            match tokio::time::timeout(KILL_GRACE, child.wait()).await {
+                Ok(st) => st.ok(),
+                Err(_) => {
+                    let _ = child.start_kill();
+                    child.wait().await.ok()
+                }
+            }
         }
     };
     let _ = write_msg(

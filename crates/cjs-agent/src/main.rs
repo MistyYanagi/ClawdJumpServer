@@ -76,6 +76,9 @@ enum Cmd {
         /// Create missing remote directories.
         #[arg(long)]
         mkdirs: bool,
+        /// Copy a directory tree (symlinks are skipped, never followed).
+        #[arg(short = 'r', long)]
+        recursive: bool,
         src: String,
         dst: String,
     },
@@ -90,13 +93,22 @@ enum Cmd {
         #[arg(short = 'R')]
         remote: Option<String>,
     },
-    /// Local SOCKS5 / HTTP CONNECT proxy whose traffic egresses via the server.
+    /// Local SOCKS5 / HTTP proxy whose traffic egresses via the server.
+    /// Prints `export` lines (with generated credentials) on stdout, or
+    /// writes them to `--env-file` (mode 0600) for `. FILE`.
     Proxy {
         #[arg(long, default_value = "127.0.0.1:1080")]
         listen: String,
         /// Exit through this device instead of the server.
         #[arg(long)]
         via: Option<String>,
+        /// Accept clients without credentials (any local process can then
+        /// use this agent's identity).
+        #[arg(long)]
+        no_auth: bool,
+        /// Write the export lines to this file (mode 0600) instead of stdout.
+        #[arg(long)]
+        env_file: Option<PathBuf>,
     },
     /// MCP server on stdio exposing ClawdJumpServer tools.
     Mcp,
@@ -297,20 +309,40 @@ async fn run(cli: Cli) -> Result<i32, ProtoError> {
                 return Ok(r.exit_code.unwrap_or(1));
             }
             use std::io::Write;
+            // Output going to a terminal gets the same clipboard filter as
+            // interactive shells; pipes and files receive the exact bytes.
+            let mut fo = std::io::stdout().is_terminal().then(term::OutputFilter::default);
+            let mut fe = std::io::stderr().is_terminal().then(term::OutputFilter::default);
+            fn emit(w: &mut dyn Write, f: &mut Option<term::OutputFilter>, b: &[u8]) {
+                match f {
+                    Some(f) => {
+                        let mut v = Vec::with_capacity(b.len());
+                        f.feed(b, &mut v);
+                        let _ = w.write_all(&v);
+                    }
+                    None => {
+                        let _ = w.write_all(b);
+                    }
+                }
+                let _ = w.flush();
+            }
             let r = ops::exec_stream(&op, &req, stdin_data, |m| match m {
-                ExecOut::Stdout(b) => {
-                    let mut o = std::io::stdout();
-                    let _ = o.write_all(b);
-                    let _ = o.flush();
-                }
-                ExecOut::Stderr(b) => {
-                    let mut o = std::io::stderr();
-                    let _ = o.write_all(b);
-                    let _ = o.flush();
-                }
+                ExecOut::Stdout(b) => emit(&mut std::io::stdout(), &mut fo, b),
+                ExecOut::Stderr(b) => emit(&mut std::io::stderr(), &mut fe, b),
                 ExecOut::Exit { .. } => {}
             })
             .await?;
+            for (w, f) in [
+                (&mut std::io::stdout() as &mut dyn Write, &mut fo),
+                (&mut std::io::stderr() as &mut dyn Write, &mut fe),
+            ] {
+                if let Some(f) = f {
+                    let mut v = Vec::new();
+                    f.finish(&mut v);
+                    let _ = w.write_all(&v);
+                    let _ = w.flush();
+                }
+            }
             if r.timed_out {
                 eprintln!("cjs: command timed out");
             }
@@ -319,11 +351,43 @@ async fn run(cli: Cli) -> Result<i32, ProtoError> {
         Cmd::Cp {
             resume,
             mkdirs,
+            recursive,
             src,
             dst,
         } => {
             let op = opener().await?;
             let dev = |d: Option<&str>| d.map(String::from).map(Ok).unwrap_or_else(device);
+            if *recursive {
+                let t = match (split_remote(src), split_remote(dst)) {
+                    (Some((d, rp)), None) => {
+                        ops::download_tree(&op, &dev(d)?, rp, std::path::Path::new(dst), *resume).await?
+                    }
+                    (None, Some((d, rp))) => {
+                        ops::upload_tree(&op, &dev(d)?, std::path::Path::new(src), rp, *resume).await?
+                    }
+                    _ => return Err(bad("exactly one of SRC and DST must be remote (device:path)")),
+                };
+                if cli.json {
+                    println!("{}", serde_json::to_string(&t).unwrap_or_default());
+                } else {
+                    eprintln!(
+                        "{} files, {} directories, {} bytes{}",
+                        t.files.len(),
+                        t.dirs,
+                        t.bytes,
+                        if t.skipped.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                "; skipped {} (symlinks/special): {}",
+                                t.skipped.len(),
+                                t.skipped.join(", ")
+                            )
+                        }
+                    );
+                }
+                return Ok(0);
+            }
             let t = match (split_remote(src), split_remote(dst)) {
                 (Some((d, rp)), None) => {
                     ops::download(&op, &dev(d)?, rp, std::path::Path::new(dst), *resume).await?
@@ -410,9 +474,15 @@ async fn run(cli: Cli) -> Result<i32, ProtoError> {
                 Err(bad("give -L or -R"))
             }
         }
-        Cmd::Proxy { listen, via } => {
+        Cmd::Proxy {
+            listen,
+            via,
+            no_auth,
+            env_file,
+        } => {
             let op = opener().await?;
-            proxy::run(op, listen, via.clone()).await?;
+            let auth = (!*no_auth).then(proxy::Auth::generate);
+            proxy::run(op, listen, via.clone(), auth, env_file.clone()).await?;
             Ok(0)
         }
         Cmd::Mcp => {

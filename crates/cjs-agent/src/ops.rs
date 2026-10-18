@@ -236,6 +236,12 @@ pub async fn download(
     let remote_sha = loop {
         match read_msg::<_, FileMsg>(&mut s).await? {
             Some(FileMsg::Chunk(b)) => {
+                if offset + got + b.len() as u64 > size {
+                    return Err(ProtoError::new(
+                        ErrorCode::Protocol,
+                        "device sent more data than the file size it announced",
+                    ));
+                }
                 f.write_all(&b).await.map_err(ioe)?;
                 got += b.len() as u64;
             }
@@ -382,6 +388,17 @@ pub async fn forward_local(
         "forwarding {} -> {device}:{host}:{port}",
         l.local_addr().map_err(ioe)?
     );
+    serve_forward_local(op, l, device, host, port).await
+}
+
+/// Serve local forwarding on an already bound listener.
+pub async fn serve_forward_local(
+    op: Opener,
+    l: tokio::net::TcpListener,
+    device: String,
+    host: String,
+    port: u16,
+) -> Result<(), ProtoError> {
     loop {
         let (mut tcp, peer) = l.accept().await.map_err(ioe)?;
         let _ = tcp.set_nodelay(true);
@@ -396,8 +413,171 @@ pub async fn forward_local(
                 Ok((mut s, _)) => {
                     let _ = tokio::io::copy_bidirectional(&mut tcp, &mut s).await;
                 }
-                Err(e) => eprintln!("forward from {peer}: {e}"),
+                Err(e) => tracing::info!(%peer, err = %e, "forward failed"),
             }
         });
+    }
+}
+
+/// Result of a recursive copy.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TreeTransfer {
+    pub files: Vec<TreeFile>,
+    pub dirs: u64,
+    pub bytes: u64,
+    /// Entries left out: symlinks (never followed) and special files.
+    pub skipped: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TreeFile {
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+/// A name the device returned in a listing. It is used to build local paths,
+/// so anything that could step outside the destination is refused.
+fn safe_name(n: &str) -> Result<&str, ProtoError> {
+    if n.is_empty() || n == "." || n == ".." || n.contains(['/', '\\', '\0']) || n.contains(':') {
+        return Err(ProtoError::new(
+            ErrorCode::Protocol,
+            format!("device returned an unsafe file name {n:?}"),
+        ));
+    }
+    Ok(n)
+}
+
+fn join_remote(base: &str, name: &str) -> String {
+    if base.ends_with('/') || base.ends_with('\\') {
+        format!("{base}{name}")
+    } else {
+        format!("{base}/{name}")
+    }
+}
+
+/// Upper bound on entries in one recursive copy, so a hostile or huge tree
+/// cannot make the client loop forever.
+const MAX_TREE_ENTRIES: usize = 100_000;
+
+/// Download the directory `device:remote` into `local` (created if missing).
+/// Symlinks are skipped, never followed.
+pub async fn download_tree(
+    op: &Opener,
+    device: &str,
+    remote: &str,
+    local: &Path,
+    resume: bool,
+) -> Result<TreeTransfer, ProtoError> {
+    let mut out = TreeTransfer::default();
+    let mut stack = vec![(remote.to_string(), local.to_path_buf(), String::new())];
+    let mut seen = 0usize;
+    while let Some((rdir, ldir, rel)) = stack.pop() {
+        let (me, entries) = list(op, device, &rdir).await?;
+        if me.kind != cjs_proto::EntryKind::Dir {
+            return Err(ProtoError::new(
+                ErrorCode::BadRequest,
+                format!("{rdir} is not a directory"),
+            ));
+        }
+        tokio::fs::create_dir_all(&ldir).await.map_err(ioe)?;
+        out.dirs += 1;
+        for e in entries {
+            seen += 1;
+            if seen > MAX_TREE_ENTRIES {
+                return Err(ProtoError::new(ErrorCode::BadRequest, "directory tree too large"));
+            }
+            let name = safe_name(&e.name)?;
+            let r = join_remote(&rdir, name);
+            let l = ldir.join(name);
+            let relp = if rel.is_empty() {
+                name.to_string()
+            } else {
+                format!("{rel}/{name}")
+            };
+            match e.kind {
+                cjs_proto::EntryKind::Dir => stack.push((r, l, relp)),
+                cjs_proto::EntryKind::File => {
+                    let t = download(op, device, &r, &l, resume).await?;
+                    out.bytes += t.size;
+                    out.files.push(TreeFile {
+                        path: relp,
+                        size: t.size,
+                        sha256: t.sha256,
+                    });
+                }
+                _ => out.skipped.push(relp),
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Upload the local directory `local` to `device:remote`. Symlinks and
+/// special files are skipped, never followed. Remote directories are created
+/// as files are written into them, so empty directories are not copied.
+pub async fn upload_tree(
+    op: &Opener,
+    device: &str,
+    local: &Path,
+    remote: &str,
+    resume: bool,
+) -> Result<TreeTransfer, ProtoError> {
+    let meta = tokio::fs::symlink_metadata(local).await.map_err(ioe)?;
+    if !meta.is_dir() {
+        return Err(ProtoError::new(
+            ErrorCode::BadRequest,
+            format!("{} is not a directory", local.display()),
+        ));
+    }
+    let mut out = TreeTransfer::default();
+    let mut stack = vec![(local.to_path_buf(), remote.to_string(), String::new())];
+    let mut seen = 0usize;
+    while let Some((ldir, rdir, rel)) = stack.pop() {
+        out.dirs += 1;
+        let mut rd = tokio::fs::read_dir(&ldir).await.map_err(ioe)?;
+        while let Some(e) = rd.next_entry().await.map_err(ioe)? {
+            seen += 1;
+            if seen > MAX_TREE_ENTRIES {
+                return Err(ProtoError::new(ErrorCode::BadRequest, "directory tree too large"));
+            }
+            let name = e.file_name().to_string_lossy().into_owned();
+            let relp = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            let ft = e.file_type().await.map_err(ioe)?;
+            let r = join_remote(&rdir, &name);
+            if ft.is_dir() {
+                stack.push((e.path(), r, relp));
+            } else if ft.is_file() {
+                let t = upload(op, device, &e.path(), &r, resume, true).await?;
+                out.bytes += t.size;
+                out.files.push(TreeFile {
+                    path: relp,
+                    size: t.size,
+                    sha256: t.sha256,
+                });
+            } else {
+                out.skipped.push(relp);
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+
+    #[test]
+    fn unsafe_names_rejected() {
+        for n in ["", ".", "..", "a/b", "a\\b", "C:x", "a\0"] {
+            assert!(safe_name(n).is_err(), "{n:?}");
+        }
+        assert_eq!(safe_name("ok.txt").unwrap(), "ok.txt");
+        assert_eq!(join_remote("a", "b"), "a/b");
+        assert_eq!(join_remote("a/", "b"), "a/b");
     }
 }

@@ -17,6 +17,7 @@ snow.workspace = true
 rand.workspace = true
 hex.workspace = true
 sha2.workspace = true
+blake3.workspace = true
 subtle.workspace = true
 tracing.workspace = true
 axum.workspace = true

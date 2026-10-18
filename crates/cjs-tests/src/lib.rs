@@ -84,6 +84,11 @@ pub async fn serve(server: &Server) -> SocketAddr {
 
 impl Env {
     pub async fn start(mode: TransportMode) -> Env {
+        Self::start_with(mode, |_| {}).await
+    }
+
+    /// Like [`Env::start`], with a hook to adjust the server configuration.
+    pub async fn start_with(mode: TransportMode, tweak: impl FnOnce(&mut ServerConfig)) -> Env {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("server");
         std::fs::create_dir_all(&data).unwrap();
@@ -93,6 +98,7 @@ impl Env {
         let mut cfg = ServerConfig::new(&data);
         cfg.lease_interval = Duration::from_millis(300);
         cfg.secure_cookies = false;
+        tweak(&mut cfg);
         let server = Server::start(cfg, keys, db, audit);
         let addr = serve(&server).await;
         let url = format!("http://{addr}/");

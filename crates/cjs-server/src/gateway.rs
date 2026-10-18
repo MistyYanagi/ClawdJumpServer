@@ -11,7 +11,7 @@ use cjs_transport::{Accepted, Authenticator, TransportServer, TransportServerCon
 use serde_json::json;
 
 use crate::accounts::sha256_hex;
-use crate::db::{new_id, now, Agent, Device};
+use crate::db::{new_id, now, Agent, Device, Enrollee};
 use crate::keys::Keys;
 use crate::state::{ConnInfo, ServerConfig, Shared};
 use crate::{db::Db, relay};
@@ -96,24 +96,7 @@ impl GatewayAuth {
             return Err(ProtoError::new(ErrorCode::Expired, "enrollment token expired"));
         }
         let id = new_id(if role == Role::Agent { "a" } else { "d" });
-        if !sh.db.consume_enroll_token(&t.id, &id).map_err(|e| e.proto())? {
-            return Err(ProtoError::new(
-                ErrorCode::Replay,
-                "enrollment token already used",
-            ));
-        }
         let info = serde_json::to_value(&hello.info).unwrap_or_default();
-        sh.audit(
-            Event::new(
-                &format!("enroll.{}", role_str(role)),
-                &id,
-                &t.name,
-                Outcome::Success,
-            )
-            .ip(peer.map(String::from))
-            .data(json!({"token": t.id, "name": t.name, "owner": t.owner_id, "pubkey": pk, "info": info})),
-        )
-        .map_err(|e| e.proto())?;
         let created_at = now();
         let agent = Agent {
             id: id.clone(),
@@ -132,20 +115,36 @@ impl GatewayAuth {
             name: t.name.clone(),
             pubkey: pk.into(),
             status: "active".into(),
-            info,
+            info: info.clone(),
             last_seen: None,
             created_at,
             groups: vec![],
         };
-        match role {
+        let who = match role {
             Role::Agent => {
                 if agent.owner_id.is_empty() {
                     return Err(ProtoError::new(ErrorCode::BadRequest, "agent token has no owner"));
                 }
-                sh.db.insert_agent(&agent).map_err(|e| e.proto())?
+                Enrollee::Agent(&agent)
             }
-            Role::Device => sh.db.insert_device(&device).map_err(|e| e.proto())?,
-        }
+            Role::Device => Enrollee::Device(&device),
+        };
+        // Token consumption, the insert and the success audit commit together.
+        sh.db
+            .enroll_principal(&t.id, who, || {
+                sh.audit(
+                    Event::new(
+                        &format!("enroll.{}", role_str(role)),
+                        &id,
+                        &t.name,
+                        Outcome::Success,
+                    )
+                    .ip(peer.map(String::from))
+                    .data(json!({"token": t.id, "name": t.name, "owner": t.owner_id, "pubkey": pk, "info": info})),
+                )
+                .map(|_| ())
+            })
+            .map_err(|e| e.proto())?;
         Ok((agent, device))
     }
 }
@@ -171,10 +170,9 @@ impl Authenticator for GatewayAuth {
                     .map_err(|e| e.proto())?;
             }
             Err(e) => {
-                let _ = self.0.audit(
-                    Event::new("gateway.reject", "anonymous", "gateway", Outcome::Denied)
-                        .ip(peer.map(String::from))
-                        .data(json!({"role": role_str(hello.role), "key": fp, "code": e.code.as_str(), "reason": e.message})),
+                self.0.audit_reject(
+                    peer,
+                    json!({"role": role_str(hello.role), "key": fp, "code": e.code.as_str(), "reason": e.message}),
                 );
             }
         }
@@ -182,14 +180,13 @@ impl Authenticator for GatewayAuth {
     }
 
     fn rejected(&self, key: Option<&[u8; 32]>, err: &ProtoError, peer: Option<&str>) {
-        let _ = self.0.audit(
-            Event::new("gateway.reject", "anonymous", "gateway", Outcome::Denied)
-                .ip(peer.map(String::from))
-                .data(json!({
-                    "key": key.map(cjs_transport::keys::fingerprint),
-                    "code": err.code.as_str(),
-                    "reason": err.message,
-                })),
+        self.0.audit_reject(
+            peer,
+            json!({
+                "key": key.map(cjs_transport::keys::fingerprint),
+                "code": err.code.as_str(),
+                "reason": err.message,
+            }),
         );
     }
 }
@@ -212,11 +209,21 @@ impl Server {
     pub fn start(cfg: ServerConfig, keys: Keys, db: Db, audit: cjs_audit::AuditLog) -> Self {
         let lease = cfg.lease_interval;
         let trust = cfg.trust_forwarded_for;
+        let handshake_limit = cfg.handshake_limit;
+        // Operators pin these out of band: the audit key verifies exported
+        // logs offline (`cjsctl audit verify --file ... --pubkey ...`).
+        tracing::info!(
+            audit_key = %hex::encode(keys.audit.verifying_key().as_bytes()),
+            audit_fingerprint = %keys.audit_fingerprint(),
+            server_key = %hex::encode(keys.noise.public),
+            "server keys (pin the audit key out of band)"
+        );
         let shared = Arc::new(Shared::new(db, audit, keys.cap, keys.noise.public, cfg));
         let (transport, accepted) = TransportServer::new(TransportServerConfig {
             key: keys.noise,
             auth: Arc::new(GatewayAuth(shared.clone())),
             trust_forwarded_for: trust,
+            handshake_limit,
         });
         let srv = Self { shared, transport };
         let s2 = srv.clone();
@@ -238,6 +245,14 @@ impl Server {
             loop {
                 t.tick().await;
                 let Some(sh) = weak.upgrade() else { return };
+                // Summarize suppressed rejections of the past minute first,
+                // so the checkpoint covers the summary.
+                let s2 = sh.clone();
+                match tokio::task::spawn_blocking(move || s2.flush_rejects(60)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::error!(err = %e, "audit reject summary failed"),
+                    Err(e) => tracing::error!(err = %e, "audit reject summary task failed"),
+                }
                 let (head, cp) = (sh.audit.head_seq(), sh.audit.last_checkpoint());
                 if let (Ok(h), Ok(c)) = (head, cp) {
                     if h > c {
@@ -320,11 +335,13 @@ async fn run_conn(sh: Arc<Shared>, a: Accepted) {
         Role::Agent => sh.db.touch_agent(&conn.principal, &info),
         Role::Device => sh.db.touch_device(&conn.principal, &info),
     };
-    let _ = sh.audit(
-        Event::new("gateway.disconnect", &conn.principal, "gateway", Outcome::Info)
-            .ip(conn.peer.clone())
-            .data(json!({"connection": conn.id, "duration_secs": now() - conn.since})),
-    );
+    let _ = sh
+        .audit_async(
+            Event::new("gateway.disconnect", &conn.principal, "gateway", Outcome::Info)
+                .ip(conn.peer.clone())
+                .data(json!({"connection": conn.id, "duration_secs": now() - conn.since})),
+        )
+        .await;
     tracing::info!(conn = %conn.id, "disconnected");
 }
 

@@ -28,12 +28,53 @@ use tokio::sync::RwLock;
 use crate::conn::{AgentConn, Opened};
 
 pub const TOKEN_FILE: &str = "daemon.token";
-pub const LOCAL_VERSION: u16 = 1;
+pub const LOCAL_VERSION: u16 = 2;
 
+/// Local IPC handshake. Neither side sends the token itself: each proves it
+/// knows it, the daemon first, so a client that reached an impostor socket
+/// or pipe (e.g. a squatted Windows pipe name while no daemon runs) sends
+/// nothing of value.
+///
+/// 1. client → daemon: `LocalHello { version, nonce }`
+/// 2. daemon → client: `DaemonProof { nonce, proof = MAC("daemon", c, d) }`
+/// 3. client → daemon: `ClientProof { proof = MAC("client", c, d) }`, then
+///    the request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalHello {
     pub version: u16,
-    pub token: String,
+    pub nonce: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonProof {
+    pub nonce: [u8; 32],
+    pub proof: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientProof {
+    pub proof: [u8; 32],
+}
+
+fn local_mac(token: &str, role: &str, client: &[u8; 32], daemon: &[u8; 32]) -> [u8; 32] {
+    let key = blake3::derive_key("ClawdJumpServer local daemon v2", token.as_bytes());
+    let mut h = blake3::Hasher::new_keyed(&key);
+    h.update(role.as_bytes());
+    h.update(&[0]);
+    h.update(client);
+    h.update(daemon);
+    *h.finalize().as_bytes()
+}
+
+fn nonce() -> [u8; 32] {
+    use rand::RngCore;
+    let mut n = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut n);
+    n
+}
+
+fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    subtle::ConstantTimeEq::ct_eq(&a[..], &b[..]).into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,11 +186,28 @@ impl Opener {
             return Err(ProtoError::new(ErrorCode::Internal, "not a daemon opener"));
         };
         let mut s = dial_local(dir).await?;
+        let c = nonce();
         write_msg(
             &mut s,
             &LocalHello {
                 version: LOCAL_VERSION,
-                token: token.clone(),
+                nonce: c,
+            },
+        )
+        .await?;
+        let dp: DaemonProof = tokio::time::timeout(Duration::from_secs(10), expect_msg(&mut s))
+            .await
+            .map_err(|_| ProtoError::new(ErrorCode::Timeout, "daemon did not answer"))??;
+        if !ct_eq(&dp.proof, &local_mac(token, "daemon", &c, &dp.nonce)) {
+            return Err(ProtoError::new(
+                ErrorCode::Unauthenticated,
+                "local daemon failed to prove it holds the daemon token (impostor socket?)",
+            ));
+        }
+        write_msg(
+            &mut s,
+            &ClientProof {
+                proof: local_mac(token, "client", &c, &dp.nonce),
             },
         )
         .await?;
@@ -278,8 +336,27 @@ impl Daemon {
             Ok(Ok(h)) => h,
             _ => return,
         };
-        let ok: bool = subtle::ConstantTimeEq::ct_eq(hello.token.as_bytes(), self.token.as_bytes()).into();
-        if !ok || hello.version != LOCAL_VERSION {
+        if hello.version != LOCAL_VERSION {
+            let _ = write_msg(
+                &mut s,
+                &OpenReply::Err(ProtoError::new(
+                    ErrorCode::Unsupported,
+                    "cjs version mismatch with the daemon",
+                )),
+            )
+            .await;
+            return;
+        }
+        let d = nonce();
+        let proof = local_mac(&self.token, "daemon", &hello.nonce, &d);
+        if write_msg(&mut s, &DaemonProof { nonce: d, proof }).await.is_err() {
+            return;
+        }
+        let cp: ClientProof = match tokio::time::timeout(Duration::from_secs(10), expect_msg(&mut s)).await {
+            Ok(Ok(p)) => p,
+            _ => return,
+        };
+        if !ct_eq(&cp.proof, &local_mac(&self.token, "client", &hello.nonce, &d)) {
             let _ = write_msg(
                 &mut s,
                 &OpenReply::Err(ProtoError::new(ErrorCode::Unauthenticated, "bad daemon token")),
@@ -392,6 +469,28 @@ pub async fn run_daemon(dir: &Path) -> Result<(), ProtoError> {
         conn: RwLock::new(None),
     });
     tokio::spawn(d.clone().keep_connected());
+    // Remove the token when the daemon stops, so clients don't keep trying
+    // a socket or pipe name that someone else could take over.
+    {
+        let tok = dir.join(TOKEN_FILE);
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            let _ = std::fs::remove_file(&tok);
+            std::process::exit(130);
+        });
+    }
+    #[cfg(unix)]
+    {
+        let tok = dir.join(TOKEN_FILE);
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            if let Ok(mut t) = signal(SignalKind::terminate()) {
+                t.recv().await;
+                let _ = std::fs::remove_file(&tok);
+                std::process::exit(143);
+            }
+        });
+    }
     let path = socket_path(dir);
     tracing::info!(socket = %path.display(), "daemon listening");
     #[cfg(unix)]

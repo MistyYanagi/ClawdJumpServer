@@ -174,6 +174,29 @@ impl Grant {
         for r in self.forward_targets.iter().chain(&self.egress) {
             r.validate()?;
         }
+        if let Some(s) = &self.schedule {
+            s.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl Schedule {
+    /// Reject windows that would silently mean something else (for example
+    /// `end_min = 2000` matching the whole day).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.start_min >= 1440 || self.end_min > 1440 {
+            return Err("schedule minutes must be within 0..1440".into());
+        }
+        if self.start_min == self.end_min {
+            return Err("schedule window is empty".into());
+        }
+        if self.days.iter().any(|d| *d > 6) {
+            return Err("schedule days are 0 (Monday) .. 6 (Sunday)".into());
+        }
+        if self.utc_offset_minutes.abs() > 14 * 60 {
+            return Err("utc_offset_minutes must be within ±14 hours".into());
+        }
         Ok(())
     }
 }
@@ -207,6 +230,10 @@ impl ApprovalStatus {
 
 /// Longest full-access window that can be approved.
 pub const MAX_FULL_ACCESS_SECS: i64 = 8 * 3600;
+
+/// A full-access request must be decided within this time; older pending
+/// requests can no longer be approved (the need is likely stale).
+pub const FULL_ACCESS_PENDING_TTL_SECS: i64 = 24 * 3600;
 
 /// Request to lift the project-root jail and the sandbox for one principal
 /// on one device. Needs a second secadmin's approval and always expires.
@@ -242,6 +269,9 @@ impl FullAccess {
         if self.status != ApprovalStatus::Pending {
             return Err(format!("request is {}", self.status.as_str()));
         }
+        if now - self.created_at > FULL_ACCESS_PENDING_TTL_SECS {
+            return Err("request is older than 24 hours; submit a new one".into());
+        }
         if !approver_roles.contains(&Role::Secadmin) {
             return Err("only a secadmin can approve full access".into());
         }
@@ -259,5 +289,171 @@ impl FullAccess {
         self.decided_at = Some(now);
         self.expires_at = Some(now + self.duration_secs);
         Ok(())
+    }
+}
+
+/// Every administrative role is privileged: granting one through the API
+/// needs a second person.
+pub const PRIVILEGED_ROLES: [Role; 3] = [Role::Sysadmin, Role::Secadmin, Role::Auditor];
+
+/// Roles that must always keep at least one active holder (otherwise
+/// approvals or audit review become impossible).
+pub const LAST_HOLDER_ROLES: [Role; 2] = [Role::Secadmin, Role::Auditor];
+
+/// Roles in `to` that are not in `from` (what a change would grant).
+pub fn added_roles(from: &[Role], to: &[Role]) -> Vec<Role> {
+    let mut v: Vec<Role> = to.iter().copied().filter(|r| !from.contains(r)).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// A pending change of a user's roles that grants a privileged role. It
+/// takes effect only when a secadmin other than the requester and the
+/// target approves it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleChange {
+    pub id: String,
+    pub user_id: String,
+    pub user_name: String,
+    /// Roles of the user when the change was requested; approval fails if
+    /// they changed in the meantime.
+    pub from_roles: Vec<Role>,
+    /// The complete new role set.
+    pub roles: Vec<Role>,
+    pub requested_by: String,
+    pub status: ApprovalStatus,
+    pub decided_by: Option<String>,
+    pub decided_at: Option<i64>,
+    pub created_at: i64,
+}
+
+impl RoleChange {
+    /// Two-person rule for privileged roles.
+    pub fn approve(&mut self, approver: &str, approver_roles: &[Role], now: i64) -> Result<(), String> {
+        if self.status != ApprovalStatus::Pending {
+            return Err(format!("request is {}", self.status.as_str()));
+        }
+        if !approver_roles.contains(&Role::Secadmin) {
+            return Err("only a secadmin can approve role changes".into());
+        }
+        if approver == self.requested_by {
+            return Err("two-person rule: the requester cannot approve their own request".into());
+        }
+        if approver == self.user_id {
+            return Err("two-person rule: you cannot approve a change of your own roles".into());
+        }
+        validate_roles(&self.roles)?;
+        self.status = ApprovalStatus::Approved;
+        self.decided_by = Some(approver.into());
+        self.decided_at = Some(now);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod role_change_tests {
+    use super::*;
+
+    fn rc() -> RoleChange {
+        RoleChange {
+            id: "rc1".into(),
+            user_id: "u_target".into(),
+            user_name: "t".into(),
+            from_roles: vec![],
+            roles: vec![Role::Auditor],
+            requested_by: "u_sys".into(),
+            status: ApprovalStatus::Pending,
+            decided_by: None,
+            decided_at: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn two_person_rule_for_roles() {
+        assert!(rc()
+            .approve("u_sys", &[Role::Sysadmin, Role::Secadmin], 1)
+            .is_err());
+        assert!(rc().approve("u_target", &[Role::Secadmin], 1).is_err());
+        assert!(rc().approve("u_other", &[Role::Sysadmin], 1).is_err());
+        let mut r = rc();
+        r.approve("u_sec", &[Role::Secadmin], 5).unwrap();
+        assert_eq!(r.status, ApprovalStatus::Approved);
+        assert_eq!(r.decided_by.as_deref(), Some("u_sec"));
+        assert!(r.approve("u_sec2", &[Role::Secadmin], 6).is_err(), "only once");
+        let mut bad = rc();
+        bad.roles = vec![Role::Secadmin, Role::Auditor];
+        assert!(bad.approve("u_sec", &[Role::Secadmin], 1).is_err());
+    }
+
+    #[test]
+    fn added_roles_detects_escalation() {
+        assert!(added_roles(&[Role::Sysadmin], &[]).is_empty());
+        assert_eq!(
+            added_roles(&[Role::Sysadmin], &[Role::Sysadmin, Role::Auditor]),
+            vec![Role::Auditor]
+        );
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn schedules_are_range_checked() {
+        let ok = Schedule {
+            days: vec![0, 6],
+            start_min: 22 * 60,
+            end_min: 6 * 60,
+            utc_offset_minutes: 480,
+        };
+        assert!(ok.validate().is_ok());
+        for bad in [
+            Schedule {
+                end_min: 2000,
+                ..ok.clone()
+            },
+            Schedule {
+                start_min: 1440,
+                ..ok.clone()
+            },
+            Schedule {
+                days: vec![7],
+                ..ok.clone()
+            },
+            Schedule {
+                start_min: 60,
+                end_min: 60,
+                ..ok.clone()
+            },
+            Schedule {
+                utc_offset_minutes: 15 * 60,
+                ..ok.clone()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn stale_full_access_requests_cannot_be_approved() {
+        let mut f = FullAccess {
+            id: "f1".into(),
+            principal: "a1".into(),
+            device: "d1".into(),
+            reason: "r".into(),
+            requested_by: "u1".into(),
+            duration_secs: 3600,
+            status: ApprovalStatus::Pending,
+            approved_by: None,
+            decided_at: None,
+            expires_at: None,
+            created_at: 1000,
+        };
+        let late = 1000 + FULL_ACCESS_PENDING_TTL_SECS + 1;
+        assert!(f.clone().approve("u2", &[Role::Secadmin], None, late).is_err());
+        assert!(f.approve("u2", &[Role::Secadmin], None, 2000).is_ok());
     }
 }

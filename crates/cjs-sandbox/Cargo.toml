@@ -12,6 +12,7 @@ thiserror.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock.workspace = true
 rlimit.workspace = true
+nix = { version = "0.28", features = ["process", "signal", "poll", "term"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rlimit.workspace = true

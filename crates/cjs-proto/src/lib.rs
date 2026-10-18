@@ -20,7 +20,10 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// Protocol version carried in [`Hello`]. Bumped on incompatible change.
-pub const PROTO_VERSION: u16 = 1;
+/// v2: transport control data (acks, close, resume, HTTP batches) is
+/// authenticated with keys derived from the Noise handshake, and the
+/// resume secret never crosses the wire (proof of possession instead).
+pub const PROTO_VERSION: u16 = 2;
 /// Noise pattern used for every connection. The client pins the server's
 /// static key, the server learns and authenticates the client's static key.
 pub const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
@@ -255,10 +258,17 @@ impl EnrollToken {
 // Transport and stream framing
 // ---------------------------------------------------------------------------
 
+/// A 32-byte keyed BLAKE3 MAC over transport control data, keyed with a
+/// key derived from the Noise handshake hash (see `cjs-transport`).
+pub type Mac = [u8; 32];
+
 /// Messages of the resumable session layer. Over WebSocket each binary
 /// message is one postcard-encoded `WireMsg`. `Seg.data` is a Noise
 /// transport message whose nonce is `seq`, so segments are authenticated,
-/// replay-proof and can be re-sent verbatim after a reconnect.
+/// replay-proof and can be re-sent verbatim after a reconnect. Every other
+/// message that can change session state carries a MAC; unauthenticated
+/// messages (`Reject`, or anything whose MAC fails) can at most end the
+/// current link, never decide the session's fate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WireMsg {
     /// Client -> server: Noise IK message 1.
@@ -266,33 +276,51 @@ pub enum WireMsg {
         noise: Vec<u8>,
     },
     /// Server -> client: Noise IK message 2 plus the session id. The resume
-    /// secret is derived by both sides from the Noise handshake hash and is
-    /// never sent in this message.
+    /// key is derived by both sides from the Noise handshake hash and is
+    /// never sent.
     Welcome {
         sid: String,
         noise: Vec<u8>,
     },
     /// Client -> server: re-attach to an existing session. `ack` is the
-    /// highest segment the client has received.
+    /// highest segment the client has received. `proof` is a MAC with the
+    /// resume key over (sid, "resume", ctr, ts, ack); `ctr` must increase
+    /// with every attempt and `ts` be within the handshake clock skew.
     Resume {
         sid: String,
-        secret: String,
+        ctr: u64,
+        ts: i64,
         ack: u64,
+        proof: Mac,
     },
     /// Server -> client: resume accepted; `ack` is the highest segment the
-    /// server has received.
+    /// server has received. `mac` (server control key) covers (ctr, ack).
     Resumed {
         ack: u64,
+        mac: Mac,
     },
+    /// Unauthenticated refusal (handshake or resume). Advisory only.
     Reject(ProtoError),
     Seg {
         seq: u64,
         data: Vec<u8>,
     },
-    Ack(u64),
-    /// The session is over (not just this link).
-    Close(ProtoError),
+    /// Cumulative acknowledgement, MAC'd with the sender's control key.
+    Ack {
+        n: u64,
+        mac: Mac,
+    },
+    /// The session is over (not just this link). MAC'd with the sender's
+    /// control key; an unauthenticated close only drops the link.
+    Close {
+        err: ProtoError,
+        mac: Mac,
+    },
 }
+
+/// HTTP header carrying the per-request proof of possession of the resume
+/// key: `<ctr>.<ts>.<hex mac>`.
+pub const HTTP_AUTH_HEADER: &str = "x-cjs-auth";
 
 /// First reply on every multiplexed stream, after the opener sent its
 /// [`OpenRequest`] / [`DeviceOpen`].
@@ -562,15 +590,20 @@ pub struct Capability {
     /// Audit session id.
     pub session: String,
     /// JSON list of network rules (`cjs_authz::net::NetRule`) the device
-    /// must apply to resolved addresses for egress (post-DNS SSRF check).
+    /// must apply to resolved addresses for egress and local forwards
+    /// (post-DNS checks).
     pub net_rules: Option<String>,
+    /// Hash of the exact request the server authorized (as sent to the
+    /// device): the device refuses to execute anything else, so a relay
+    /// cannot change the command, paths or environment under a valid token.
+    pub req_hash: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedCapability {
     /// postcard-encoded [`Capability`].
     pub body: Vec<u8>,
-    /// Ed25519 signature over `b"cjs-cap-v1" || body`.
+    /// Ed25519 signature over `b"cjs-cap-v2" || body`.
     pub sig: Vec<u8>,
 }
 
@@ -870,13 +903,19 @@ pub struct HttpOpenResponse {
 
 /// Body of `POST /v1/t/{sid}/tx` and of `GET /v1/t/{sid}/rx` responses:
 /// sequence-numbered Noise transport messages (same as `WireMsg::Seg`).
+/// Requests are authenticated by [`HTTP_AUTH_HEADER`] (which binds the
+/// body); responses by `mac`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HttpBatch {
-    /// For `tx` requests: highest downlink seq the client has received.
+    /// Highest segment the sender has received.
     pub ack: u64,
     pub msgs: Vec<(u64, Vec<u8>)>,
-    /// Set by the server when the session is gone.
+    /// The session is over (client: closing it; server: it was closed).
     pub closed: Option<ProtoError>,
+    /// Server responses: MAC with the server control key over
+    /// (kind, request ctr, ack, closed). `None` for unauthenticated
+    /// responses (unknown session), which the client must not trust.
+    pub mac: Option<Mac>,
 }
 
 // ---------------------------------------------------------------------------
