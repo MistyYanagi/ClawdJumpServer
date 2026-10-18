@@ -27,6 +27,43 @@ async fn session_end(env: &Env, session: &str) -> cjs_audit::StoredRecord {
     panic!("no session.end for {session}");
 }
 
+/// T3: concurrent opens cannot race past `max_sessions`: decision and
+/// slot reservation are atomic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_sessions_holds_under_concurrent_opens() {
+    let env = Env::start(mode_from_env()).await;
+    let mut g = env.grant("g1", &[Action::Exec]);
+    g.max_sessions = Some(1);
+    env.put_grant(&g);
+    let a = std::sync::Arc::new(env.agent().await);
+    let mut hs = vec![];
+    for _ in 0..8 {
+        let a = a.clone();
+        hs.push(tokio::spawn(async move {
+            a.open(exec_req("dev1", "sleep 2")).await.map(|(s, _)| s)
+        }));
+    }
+    let mut ok = vec![];
+    for h in hs {
+        match h.await.unwrap() {
+            Ok(s) => ok.push(s),
+            Err(e) => assert_eq!(e.code, cjs_proto::ErrorCode::LimitExceeded, "{e}"),
+        }
+    }
+    assert_eq!(ok.len(), 1, "max_sessions=1 admitted {} sessions", ok.len());
+    // The slot is released when the session ends.
+    drop(ok);
+    let mut admitted = false;
+    for _ in 0..100 {
+        if run_exec(&a, exec_req("dev1", "echo again")).await.is_ok() {
+            admitted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(admitted, "slot never released");
+}
+
 /// T4: a terminal session that exceeds the recording size limit is
 /// terminated and the reason is audited; the recording stays bounded and
 /// its audited hash matches the file.

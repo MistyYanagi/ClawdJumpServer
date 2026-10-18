@@ -217,7 +217,12 @@ async fn open_and_relay(
 ) -> Result<(), ProtoError> {
     let session = new_id("s");
     let stream_id = sh.next_stream_id();
-    let (dec, device) = sh.decide(p, &req, None).map_err(|e| e.proto())?;
+    // Decision and concurrency slot are taken atomically; the slot is
+    // released when this function returns (the registered stream then
+    // counts until it ends).
+    let (dec, device, _slot) = sh
+        .decide_and_reserve(p, &req, stream_id)
+        .map_err(|e| e.proto())?;
     let target = device
         .as_ref()
         .map(|d| d.id.clone())

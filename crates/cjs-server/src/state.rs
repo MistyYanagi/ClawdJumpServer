@@ -199,6 +199,10 @@ struct RegInner {
     conns: HashMap<String, Arc<ConnInfo>>,
     device_conn: HashMap<String, String>,
     streams: HashMap<u32, Arc<StreamInfo>>,
+    /// Admitted streams that are not registered yet (device still being
+    /// contacted): stream id -> (principal, grant ids). They count against
+    /// concurrency limits like live streams.
+    reserved: HashMap<u32, (String, Vec<String>)>,
     listeners: HashMap<(String, u32), Arc<ListenerReg>>,
 }
 
@@ -222,6 +226,25 @@ pub struct StreamGuard<'a> {
 impl Drop for StreamGuard<'_> {
     fn drop(&mut self) {
         self.reg.lock().streams.remove(&self.id);
+    }
+}
+
+/// A concurrency slot taken at admission; released when dropped (the
+/// registered stream, if any, then keeps counting until it ends).
+pub struct Reservation<'a> {
+    reg: &'a Registry,
+    id: u32,
+}
+
+impl std::fmt::Debug for Reservation<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reservation").field("id", &self.id).finish()
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.reg.lock().reserved.remove(&self.id);
     }
 }
 
@@ -302,14 +325,30 @@ impl Registry {
             .collect()
     }
 
-    /// Open streams of `principal` covered by `grant`, excluding `exclude`.
+    /// Open (or admitted but not yet registered) streams of `principal`
+    /// covered by `grant`, excluding `exclude`.
     pub fn active(&self, principal: &str, grant: &str, exclude: Option<u32>) -> u32 {
-        self.lock()
+        let g = self.lock();
+        let live = g
             .streams
             .values()
             .filter(|s| Some(s.id) != exclude && s.principal == principal)
-            .filter(|s| s.kind != StreamKind::Rpc && s.grant_ids.iter().any(|g| g == grant))
-            .count() as u32
+            .filter(|s| s.kind != StreamKind::Rpc && s.grant_ids.iter().any(|x| x == grant))
+            .count();
+        let pending = g
+            .reserved
+            .iter()
+            .filter(|(id, _)| Some(**id) != exclude && !g.streams.contains_key(id))
+            .filter(|(_, (p, grants))| p == principal && grants.iter().any(|x| x == grant))
+            .count();
+        (live + pending) as u32
+    }
+
+    fn reserve(&self, id: u32, principal: &str, grants: &[String]) -> Reservation<'_> {
+        self.lock()
+            .reserved
+            .insert(id, (principal.to_string(), grants.to_vec()));
+        Reservation { reg: self, id }
     }
 
     pub fn add_listener(&self, device_conn: &str, id: u32, l: Arc<ListenerReg>) -> ListenerGuard<'_> {
@@ -341,6 +380,9 @@ pub struct Shared {
     pub cfg: ServerConfig,
     pub reg: Registry,
     stream_seq: AtomicU32,
+    /// Serializes "decide + reserve a concurrency slot" so concurrent opens
+    /// cannot all pass a `max_sessions` check before any is counted.
+    admission: Mutex<()>,
     /// Failed web logins per client address: (count, window start).
     pub login_failures: Mutex<HashMap<String, (u32, i64)>>,
 }
@@ -367,6 +409,7 @@ impl Shared {
             cfg,
             reg: Registry::default(),
             stream_seq: AtomicU32::new(1),
+            admission: Mutex::new(()),
             login_failures: Mutex::new(HashMap::new()),
         }
     }
@@ -482,6 +525,23 @@ impl Shared {
             now: now(),
         };
         Ok((cjs_authz::decide(&ar, &grants, &full), device))
+    }
+
+    /// Decide `req` for a new stream `stream_id` and, when allowed,
+    /// atomically reserve its concurrency slot in every grant that allowed
+    /// it. Keep the reservation alive until the stream is registered (or
+    /// the open failed).
+    pub fn decide_and_reserve(
+        &self,
+        p: &Principal,
+        req: &OpenRequest,
+        stream_id: u32,
+    ) -> Result<(Decision, Option<Device>, Option<Reservation<'_>>), ApiError> {
+        let _g = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        let (d, dev) = self.decide(p, req, None)?;
+        let res = (d.allow && req.kind() != StreamKind::Rpc)
+            .then(|| self.reg.reserve(stream_id, &p.id, &d.grant_ids));
+        Ok((d, dev, res))
     }
 
     pub fn conn_summaries(&self) -> Vec<ConnSummary> {
