@@ -23,14 +23,20 @@ pub type MuxStream = Compat<yamux::Stream>;
 pub use yamux::Mode;
 
 /// Maximum concurrent streams per connection.
-pub const MAX_STREAMS: usize = 512;
+pub const MAX_STREAMS: usize = 128;
+
+/// Receive buffer budget of one connection, all streams together. yamux
+/// guarantees every stream its 256 KiB minimum window (128 * 256 KiB =
+/// 32 MiB); the remaining 16 MiB is shared by streams whose window
+/// auto-tunes upwards, so one bulk stream can grow to about 16 MiB while a
+/// peer can never make us buffer more than this per connection.
+pub const MAX_CONNECTION_RECEIVE_WINDOW: usize = 48 * 1024 * 1024;
 
 fn config() -> yamux::Config {
     let mut c = yamux::Config::default();
-    // 512 streams * 256 KiB minimum window; cap the whole connection at
-    // 256 MiB of receive buffer so a peer cannot balloon our memory.
+    // Order matters: yamux asserts window >= streams * 256 KiB on each set.
     c.set_max_num_streams(MAX_STREAMS);
-    c.set_max_connection_receive_window(Some(256 * 1024 * 1024));
+    c.set_max_connection_receive_window(Some(MAX_CONNECTION_RECEIVE_WINDOW));
     c
 }
 
@@ -318,6 +324,39 @@ mod tests {
         }
         s.shutdown().await.unwrap();
         assert_eq!(reader.await.unwrap(), 128 * 64 * 1024);
+    }
+
+    #[test]
+    fn limits_are_bounded() {
+        // Constructing the config runs yamux's own consistency assertions.
+        let _ = config();
+        assert!(MAX_STREAMS <= 128);
+        assert!(MAX_CONNECTION_RECEIVE_WINDOW <= 64 * 1024 * 1024);
+        assert!(MAX_CONNECTION_RECEIVE_WINDOW >= MAX_STREAMS * yamux::DEFAULT_CREDIT as usize);
+    }
+
+    #[tokio::test]
+    async fn stream_count_is_capped() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (client, _cin, _ct) = spawn(a, Mode::Client);
+        let (_server, mut sin, _st) = spawn(b, Mode::Server);
+        tokio::spawn(async move {
+            let mut keep = Vec::new();
+            while let Some(s) = sin.recv().await {
+                keep.push(s);
+            }
+        });
+        let mut open = Vec::new();
+        for _ in 0..MAX_STREAMS {
+            let mut s = client.open().await.unwrap();
+            // Make the stream known to the peer.
+            s.write_all(b"x").await.unwrap();
+            open.push(s);
+        }
+        assert!(
+            client.open().await.is_err(),
+            "more than MAX_STREAMS concurrent streams"
+        );
     }
 
     #[tokio::test]
