@@ -69,7 +69,7 @@ Noise 传输消息之外的一切都可能被会重签 TLS 的代理看到或伪
 
 ## 能力令牌
 
-`Capability{version, id, principal, device, action, roots, full_access, issued_at, expires_at, stream, connection, target, session, net_rules}`，Ed25519 签名覆盖 `b"cjs-cap-v1" || postcard(body)`。设备拒绝：签名错误、设备不符、连接不符、流不符、动作不符、网络目标不符、过期或 TTL 超过 60 秒、无项目根且非全权限、id 重放。`net_rules` 只用于经设备出口，设备据此对解析出的地址做 SSRF 二次校验。
+`Capability{version, id, principal, device, action, roots, full_access, issued_at, expires_at, stream, connection, target, session, net_rules}`，Ed25519 签名覆盖 `b"cjs-cap-v1" || postcard(body)`。设备拒绝：签名错误、设备不符、连接不符、流不符、动作不符、网络目标不符、过期或 TTL 超过 60 秒、无项目根且非全权限、id 重放。`net_rules`（JSON 编码的规则列表）只出现在 `Egress` 与 `ForwardL` 的令牌里，设备据此对解析出的地址做二次校验（出口：`ip_allowed`；本地转发：deny 规则与元数据地址，`forward_ip_allowed`），缺失或格式错误时拒绝。
 
 ## 错误码
 
@@ -77,4 +77,10 @@ Noise 传输消息之外的一切都可能被会重签 TLS 的代理看到或伪
 
 ## agent 本地守护进程协议
 
-socket：`<配置目录>/agent.sock`（Windows：`\\.\pipe\cjs-agent-<hash>`）。客户端发送 `LocalHello{version, token}`，然后发送一条 `LocalRequest`：`Open(OpenRequest)`（之后透明拼接）、`ForwardR{req, local_host, local_port}` 或 `Status`。
+socket：`<配置目录>/agent.sock`（Windows：`\\.\pipe\cjs-agent-<hash>`），定义在 `crates/cjs-agent/src/local.rs`（`LOCAL_VERSION = 2`）。令牌（`daemon.token`）从不上线，双方做挑战-应答，守护进程先证明：
+
+1. 客户端 → 守护进程：`LocalHello{version, nonce_c}`
+2. 守护进程 → 客户端：`DaemonProof{nonce_d, proof = MAC("daemon", nonce_c, nonce_d)}`，客户端验证失败即断开（冒名 socket / 管道）
+3. 客户端 → 守护进程：`ClientProof{proof = MAC("client", nonce_c, nonce_d)}`
+
+MAC 为带密钥的 BLAKE3，密钥 `derive_key("ClawdJumpServer local daemon v2", token)`，常量时间比较。之后客户端发送一条 `LocalRequest`：`Open(OpenRequest)`（之后透明拼接）、`ForwardR{req, local_host, local_port}` 或 `Status`。

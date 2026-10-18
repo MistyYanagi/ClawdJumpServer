@@ -1,0 +1,8 @@
+# Build context for the Dockerfile: sources only.
+.git
+.github
+.claude
+target
+target*
+**/target
+**/*.rs.bk
