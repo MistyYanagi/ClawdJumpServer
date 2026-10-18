@@ -28,7 +28,8 @@ pub struct Decision {
     pub grant_ids: Vec<String>,
     pub roots: Vec<String>,
     pub full_access: Option<String>,
-    /// Egress rules of the matching grants, for the post-DNS IP check.
+    /// Network rules of the matching grants (`egress`, or `forward_targets`
+    /// for local forwards), for the post-DNS IP check.
     pub egress_rules: Vec<net::NetRule>,
 }
 
@@ -158,7 +159,13 @@ pub fn decide(req: &AccessRequest, grants: &[Grant], full: &[FullAccess]) -> Dec
         grant_ids: with_room.iter().map(|g| g.id.clone()).collect(),
         roots,
         full_access,
-        egress_rules: with_room.iter().flat_map(|g| g.egress.clone()).collect(),
+        egress_rules: with_room
+            .iter()
+            .flat_map(|g| match req.action {
+                Action::ForwardLocal => g.forward_targets.clone(),
+                _ => g.egress.clone(),
+            })
+            .collect(),
     }
 }
 

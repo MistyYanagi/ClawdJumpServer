@@ -10,6 +10,9 @@ rust-version.workspace = true
 cap-std.workspace = true
 cjs-proto.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile.workspace = true
 

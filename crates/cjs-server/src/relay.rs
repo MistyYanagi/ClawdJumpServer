@@ -297,7 +297,7 @@ async fn open_and_relay(
         target: req.net_target(),
         session: session.clone(),
         net_rules: match req {
-            OpenRequest::Egress { .. } => Some(
+            OpenRequest::Egress { .. } | OpenRequest::ForwardL { .. } => Some(
                 serde_json::to_string(&dec.egress_rules)
                     .map_err(|e| perr(ErrorCode::Internal, e.to_string()))?,
             ),
@@ -547,11 +547,14 @@ fn cancelled(info: &StreamInfo) -> ProtoError {
 /// Relay typed messages. `on_in` inspects agent -> device messages,
 /// `on_out` device -> agent messages and returns true for the final one.
 /// On error or cancellation `abort` builds the messages sent to the agent
-/// before the stream is closed.
+/// before the stream is closed, and `stop_dev` (if any) is sent to the
+/// device so it ends the session's processes instead of only seeing the
+/// stream close (which, for exec, merely ends stdin).
 async fn relay_typed<I, O, FI, FO, FA>(
     agent: &mut MuxStream,
     dev: &mut MuxStream,
     info: &StreamInfo,
+    stop_dev: Option<I>,
     mut on_in: FI,
     mut on_out: FO,
     abort: FA,
@@ -615,6 +618,9 @@ where
         }
     };
     if let Err(e) = &result {
+        if let Some(m) = &stop_dev {
+            let _ = tokio::time::timeout(Duration::from_secs(2), write_msg(&mut dw, m)).await;
+        }
         for m in abort(e) {
             if write_msg(&mut aw, &m).await.is_err() {
                 break;
@@ -647,6 +653,7 @@ async fn relay_pty(
         agent,
         dev,
         info,
+        None,
         |m| {
             let mut rec = rec.lock().unwrap_or_else(|p| p.into_inner());
             match m {
@@ -718,6 +725,7 @@ async fn relay_exec(
         agent,
         dev,
         info,
+        Some(ExecIn::Kill),
         |m| {
             if let ExecIn::Stdin(b) = m {
                 stdin += b.len() as u64;
@@ -786,6 +794,7 @@ async fn relay_file_get(
         agent,
         dev,
         info,
+        None,
         no_input,
         |m| match m {
             FileMsg::Meta { size, mode, mtime } => {
@@ -831,6 +840,7 @@ async fn relay_file_put(
         agent,
         dev,
         info,
+        None,
         |m| match m {
             FileMsg::Chunk(b) if !ended => {
                 bytes += b.len() as u64;
@@ -872,6 +882,7 @@ async fn relay_file_list(
         agent,
         dev,
         info,
+        None,
         no_input,
         |m| match m {
             FileMsg::Stat(_) => Ok(false),
