@@ -188,7 +188,9 @@ async fn live_watch_is_role_checked_and_audited() {
     let sec = env.web("sec").await;
     let (st, _) = sec.call("GET", &path, None).await;
     assert_eq!(st, 200);
-    write_msg(&mut s, &PtyIn::Input(b"exit\n".to_vec())).await.unwrap();
+    write_msg(&mut s, &PtyIn::Input(b"exit\n".to_vec()))
+        .await
+        .unwrap();
     let mut ended = false;
     for _ in 0..100 {
         let p = format!("/sessions/{session}/live?after={off}&wait=1");

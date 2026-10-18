@@ -20,7 +20,7 @@
 ## 2. 与原计划不同的决定
 
 - **多路复用用 yamux，没有自写 mux。** 可靠性放在下面一层：序号、累计确认、ACK 前保留分段、重连后重发都在 `cjs-transport/src/core.rs`；yamux 只负责流与流控（每连接 128 条流、连接接收缓冲上限 48 MiB）。
-- **没有 15 分钟会话令牌。** 取而代之的是：长连接上每条流每 5 秒（以及每次管理操作后）重新决策一次（租约检查），撤销即断；设备侧每条流一个 60 秒有效的 Ed25519 能力令牌，绑定设备、连接、yamux 流 id、动作、目标。
+- **没有 15 分钟会话令牌。** 取而代之的是：长连接上每条流每 5 秒（以及每次管理操作后）重新决策一次（租约检查），撤销即断；设备侧每条流一个 60 秒有效的 Ed25519 能力令牌，绑定设备、连接、yamux 流 id、动作、目标以及请求本身的哈希（中继改不了命令和路径）。
 - **“项目”不是独立实体。** 项目就是授权里的 `project_roots`，没有项目表、项目成员或项目级 API。
 - **Web 控制台用纯 JavaScript，没有用 Leptos/WASM。** 不需要 wasm 工具链，CSP 可以是 `script-src 'self'`，供应链更小；服务端数据一律用 `textContent` 渲染。（`Cargo.toml` 里 `exclude = ["crates/cjs-web"]` 的注释是遗留。）
 - **OpenAPI 文档由路由表生成**（`api::ROUTES`），没有引入 utoipa。
@@ -60,7 +60,10 @@ crates/cjs-tests     lib.rs（夹具） tests/{pty,streams,plan_e2e,hardening,sa
 - 设备端上传后的校验和要用新的只读句柄计算，写句柄是只写的。
 - 一次性密钥（初始口令、注册令牌）在 Web 控制台重新渲染后必须保留（`state.flash`）。
 - 用 `pgrep -f` 杀进程时模式会匹配到执行它的 shell 本身。
-- `Cargo.lock` 里的依赖需要 Rust 1.88，而 `rust-version` 仍写 1.85（CI 用 stable，没有发现）；Dockerfile 用 1.88。
+- `Cargo.lock` 里的依赖需要 Rust 1.88（`rust-version` 已改为 1.88；Dockerfile 用 1.88）。
+- 多个 git worktree 不能共用一个 `CARGO_TARGET_DIR`：工作区内 crate 的产物名与路径无关，会互相覆盖，编出另一份源码。
+- exec 流被正常关闭只表示 stdin 结束；要结束命令必须发 `ExecIn::Kill`（中继中止会话时会发），否则撤销后进程仍在设备上运行。
+- 沙箱 helper 不能直接 `exec` 命令：它要作为 subreaper 留下来，会话结束时杀掉整棵进程树（`setsid`、二次 fork 的后台任务）。
 
 ## 6. 已知限制与后续
 
@@ -70,4 +73,7 @@ crates/cjs-tests     lib.rs（夹具） tests/{pty,streams,plan_e2e,hardening,sa
 - 录像包含键入的输入（包括在终端里输入的口令）；可考虑可选不记录输入事件。
 - sysadmin 经 API 创建用户时会拿到其初始口令和 TOTP 密钥。
 - 没有全局内存预算：握手限速、yamux 缓冲等都是按来源地址 / 按连接计算。
-- 把 `rust-version` 改为 1.88 并在 CI 里加一个 MSRV 任务。
+- CI 里加一个 MSRV（1.88）任务。
+- 文件上传直接写目标文件（续传依赖这一点），中途失败会留下不完整的文件。
+- 授权时间窗用固定 UTC 偏移，不跟随夏令时。
+- Web 控制台里用户角色编辑和组成员增删仍用浏览器自带的 `prompt()`。

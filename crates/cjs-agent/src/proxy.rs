@@ -90,7 +90,9 @@ pub async fn run(
             .map(|v| format!(", exiting via {v}"))
             .unwrap_or_default()
     );
-    // Lines for `eval "$(cjs proxy)"`; diagnostics go to stderr.
+    // Export lines on stdout (or --env-file, for `. FILE`; the proxy keeps
+    // running, so `eval "$(cjs proxy)"` would never return). Diagnostics go
+    // to stderr.
     let lines = export_lines(&addr.to_string(), auth.as_ref());
     match env_file {
         Some(p) => write_private(&p, &format!("{lines}\n"))

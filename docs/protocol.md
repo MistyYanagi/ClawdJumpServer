@@ -69,7 +69,7 @@ Noise 传输消息之外的一切都可能被会重签 TLS 的代理看到或伪
 
 ## 能力令牌
 
-`Capability{version, id, principal, device, action, roots, full_access, issued_at, expires_at, stream, connection, target, session, net_rules}`，Ed25519 签名覆盖 `b"cjs-cap-v1" || postcard(body)`。设备拒绝：签名错误、设备不符、连接不符、流不符、动作不符、网络目标不符、过期或 TTL 超过 60 秒、无项目根且非全权限、id 重放。`net_rules`（JSON 编码的规则列表）只出现在 `Egress` 与 `ForwardL` 的令牌里，设备据此对解析出的地址做二次校验（出口：`ip_allowed`；本地转发：deny 规则与元数据地址，`forward_ip_allowed`），缺失或格式错误时拒绝。
+`Capability{version = 2, id, principal, device, action, roots, full_access, issued_at, expires_at, stream, connection, target, session, net_rules, req_hash}`，Ed25519 签名覆盖 `b"cjs-cap-v2" || postcard(body)`。`req_hash = BLAKE3-derive-key("ClawdJumpServer capability request v2", postcard(req))`，`req` 是 `DeviceOpen.req`（发给设备的请求）。设备拒绝：签名错误、设备不符、连接不符、流不符、动作不符、网络目标不符、请求哈希不符、过期或 TTL 超过 60 秒、无项目根且非全权限（经设备出口除外）、id 重放。`net_rules`（JSON 编码的规则列表）只出现在 `Egress` 与 `ForwardL` 的令牌里，设备据此对解析出的地址做二次校验（出口：`ip_allowed`；本地转发：deny 规则与元数据地址，`forward_ip_allowed`），缺失或格式错误时拒绝。
 
 ## 错误码
 
