@@ -47,7 +47,10 @@ pub(crate) async fn run(
         })
         .map_err(pe)?;
     // Only this session's terminal is writable inside the sandbox.
+    #[cfg(unix)]
     let tty = pair.master.tty_name();
+    #[cfg(not(unix))]
+    let tty: Option<std::path::PathBuf> = None;
     let argv = command.clone().unwrap_or_else(default_shell);
     let argv = sandboxed_argv(ctx, cap, &jail, &scratch, tty, argv)?;
     let mut cmd = CommandBuilder::new(&argv[0]);
