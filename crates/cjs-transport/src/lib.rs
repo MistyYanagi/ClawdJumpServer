@@ -15,8 +15,13 @@
 //!   number. Segments are kept until acknowledged, so a broken link is
 //!   re-attached (`Resume`) and unacknowledged segments are re-sent verbatim
 //!   without losing or duplicating stream data.
-//! * The resume secret is derived from the Noise handshake hash; it is never
-//!   sent in the clear except as proof when re-attaching.
+//! * Control data outside Noise messages (acks, close, resume, HTTP
+//!   batches) is MAC'd with keys derived from the Noise handshake hash
+//!   (see `mac`). Anything unauthenticated can at most drop a link: a
+//!   forged close or ack is ignored and the session is resumed.
+//! * Re-attaching proves possession of the resume key with a MAC over
+//!   (sid, kind, counter, timestamp, H(data)); the key itself never crosses
+//!   the wire, and counters make captured requests unreplayable.
 #![forbid(unsafe_code)]
 
 pub mod client;
@@ -25,6 +30,7 @@ mod handshake;
 mod io;
 pub mod keys;
 mod link;
+mod mac;
 pub mod profile;
 pub mod server;
 pub mod tls;
@@ -33,7 +39,9 @@ pub use crate::core::SessionHandle;
 pub use crate::io::SessionIo;
 pub use client::{connect, new_hello, ClientConfig, ClientConn, TransportMode};
 pub use keys::StaticKeypair;
-pub use server::{peer_addr, Accepted, Authenticator, TransportServer, TransportServerConfig};
+pub use server::{
+    peer_addr, Accepted, Authenticator, HandshakeLimit, TransportServer, TransportServerConfig,
+};
 
 /// How long a session survives without any attached link.
 pub const SESSION_GRACE: std::time::Duration = std::time::Duration::from_secs(90);

@@ -5,8 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use cjs_proto::{ErrorCode, ProtoError, MAX_FRAME_PLAINTEXT, NOISE_MAX_MSG};
+use cjs_proto::{ErrorCode, ProtoError, WireMsg, MAX_FRAME_PLAINTEXT, NOISE_MAX_MSG};
 use tokio::sync::{mpsc, watch};
+
+use crate::mac::{self, CtlKeys};
 
 /// Unacknowledged bytes we buffer before applying backpressure.
 const MAX_UNACKED: usize = 8 * 1024 * 1024;
@@ -25,10 +27,14 @@ pub(crate) struct Core {
     st: Mutex<State>,
     ver: watch::Sender<u64>,
     noise: snow::StatelessTransportState,
+    pub(crate) keys: CtlKeys,
 }
 
 impl Core {
-    pub(crate) fn new(noise: snow::StatelessTransportState) -> (Arc<Core>, mpsc::UnboundedReceiver<Bytes>) {
+    pub(crate) fn new(
+        noise: snow::StatelessTransportState,
+        keys: CtlKeys,
+    ) -> (Arc<Core>, mpsc::UnboundedReceiver<Bytes>) {
         let (in_tx, in_rx) = mpsc::unbounded_channel();
         let core = Core {
             st: Mutex::new(State {
@@ -42,6 +48,7 @@ impl Core {
             }),
             ver: watch::channel(0).0,
             noise,
+            keys,
         };
         (Arc::new(core), in_rx)
     }
@@ -86,7 +93,31 @@ impl Core {
         }
     }
 
-    /// Peer acknowledged everything up to and including `n`.
+    /// An authenticated acknowledgement of everything up to `n`.
+    pub(crate) fn ack_msg(&self, n: u64) -> WireMsg {
+        WireMsg::Ack {
+            n,
+            mac: mac::tag(&self.keys.send, "ack", &n),
+        }
+    }
+
+    /// An authenticated close message.
+    pub(crate) fn close_msg(&self, err: ProtoError) -> WireMsg {
+        let m = mac::tag(&self.keys.send, "close", &err);
+        WireMsg::Close { err, mac: m }
+    }
+
+    pub(crate) fn check_ack(&self, n: u64, m: &[u8]) -> bool {
+        mac::check(&self.keys.recv, "ack", &n, m)
+    }
+
+    pub(crate) fn check_close(&self, err: &ProtoError, m: &[u8]) -> bool {
+        mac::check(&self.keys.recv, "close", err, m)
+    }
+
+    /// Peer acknowledged everything up to and including `n`. Only call
+    /// this with an authenticated value: an ack beyond the data sent is a
+    /// protocol violation that ends the session.
     pub(crate) fn ack(&self, n: u64) -> Result<(), ProtoError> {
         let mut st = self.st.lock().unwrap();
         if n >= st.next_seq {
@@ -112,7 +143,10 @@ impl Core {
         self.st.lock().unwrap().acked
     }
 
-    /// Handle an incoming segment.
+    /// Handle an incoming segment. An error means the segment was not
+    /// accepted (forged, corrupted or out of order); callers treat it as a
+    /// broken link, never as the end of the session, so injected garbage
+    /// cannot kill a session.
     pub(crate) fn receive(&self, seq: u64, ct: &[u8]) -> Result<(), ProtoError> {
         let mut st = self.st.lock().unwrap();
         if st.closed.is_some() {

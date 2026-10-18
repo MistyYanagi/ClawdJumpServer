@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cjs_proto::{ErrorCode, ProtoError, WireMsg};
+use cjs_proto::WireMsg;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::watch;
 
@@ -35,9 +35,10 @@ where
     S: Sink<WireMsg> + Unpin,
     R: Stream<Item = WireMsg> + Unpin,
 {
+    // `peer_ack` was authenticated by the resume exchange.
     if let Err(e) = core.ack(peer_ack) {
         core.close(e.clone());
-        let _ = sink.send(WireMsg::Close(e)).await;
+        let _ = sink.send(core.close_msg(e)).await;
         return LinkEnd::Closed;
     }
     let my_gen = *superseded.borrow_and_update();
@@ -50,20 +51,39 @@ where
             let Some(m) = stream.next().await else {
                 return LinkEnd::Lost;
             };
-            *last_rx.lock().unwrap() = Instant::now();
-            let res = match m {
-                WireMsg::Seg { seq, data } => core.receive(seq, &data),
-                WireMsg::Ack(n) => core.ack(n),
-                WireMsg::Close(e) => {
-                    core.close(e);
+            // Anything that is not authenticated only ends this link (the
+            // session is then resumed); it can never close the session.
+            match m {
+                WireMsg::Seg { seq, data } => {
+                    if let Err(e) = core.receive(seq, &data) {
+                        tracing::warn!(err = %e, "rejected segment; dropping link");
+                        return LinkEnd::Lost;
+                    }
+                }
+                WireMsg::Ack { n, mac } => {
+                    if !core.check_ack(n, &mac) {
+                        tracing::warn!("unauthenticated ack; dropping link");
+                        return LinkEnd::Lost;
+                    }
+                    if let Err(e) = core.ack(n) {
+                        core.close(e);
+                        return LinkEnd::Closed;
+                    }
+                }
+                WireMsg::Close { err, mac } => {
+                    if !core.check_close(&err, &mac) {
+                        tracing::warn!(err = %err, "unauthenticated close ignored; dropping link");
+                        return LinkEnd::Lost;
+                    }
+                    core.close(err);
                     return LinkEnd::Closed;
                 }
-                _ => Err(ProtoError::new(ErrorCode::Protocol, "unexpected message on link")),
-            };
-            if let Err(e) = res {
-                core.close(e);
-                return LinkEnd::Closed;
+                _ => {
+                    tracing::warn!("unexpected message on link; dropping link");
+                    return LinkEnd::Lost;
+                }
             }
+            *last_rx.lock().unwrap() = Instant::now();
         }
     };
 
@@ -76,13 +96,13 @@ where
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             if let Some(e) = core.closed() {
-                let _ = sink.send(WireMsg::Close(e)).await;
+                let _ = sink.send(core.close_msg(e)).await;
                 return LinkEnd::Closed;
             }
             let mut wrote = false;
             let a = core.recv_ack();
             if last_ack_sent == u64::MAX || a >= last_ack_sent.saturating_add(ACK_EVERY) {
-                if sink.feed(WireMsg::Ack(a)).await.is_err() {
+                if sink.feed(core.ack_msg(a)).await.is_err() {
                     return LinkEnd::Lost;
                 }
                 last_ack_sent = a;
@@ -114,7 +134,7 @@ where
                 _ = tick.tick() => {
                     let a = core.recv_ack();
                     if a != last_ack_sent || last_tx.elapsed() >= KEEPALIVE {
-                        if sink.send(WireMsg::Ack(a)).await.is_err() { return LinkEnd::Lost; }
+                        if sink.send(core.ack_msg(a)).await.is_err() { return LinkEnd::Lost; }
                         last_ack_sent = a;
                         last_tx = Instant::now();
                     }
@@ -131,7 +151,7 @@ where
             if e == LinkEnd::Closed {
                 // Tell the peer why, best effort.
                 if let Some(err) = core.closed() {
-                    let _ = sink.send(WireMsg::Close(err)).await;
+                    let _ = sink.send(core.close_msg(err)).await;
                 }
             }
             e

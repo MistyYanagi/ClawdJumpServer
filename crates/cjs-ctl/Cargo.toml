@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 cjs-proto.workspace = true
+cjs-audit.workspace = true
 cjs-transport.workspace = true
 tokio.workspace = true
 reqwest.workspace = true

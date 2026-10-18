@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use cjs_proto::{
     decode, encode, ErrorCode, Hello, HttpBatch, HttpOpenResponse, ProtoError, Welcome, WireMsg,
+    HTTP_AUTH_HEADER,
 };
 use futures::{SinkExt, StreamExt};
 use tokio::sync::watch;
@@ -16,6 +17,7 @@ use crate::handshake::ClientHs;
 use crate::io::SessionIo;
 use crate::keys::StaticKeypair;
 use crate::link::{run_link, LinkEnd};
+use crate::mac;
 use crate::tls;
 use crate::SESSION_GRACE;
 
@@ -78,6 +80,23 @@ impl std::fmt::Debug for ClientConn {
 
 fn ioe(m: impl std::fmt::Display) -> ProtoError {
     ProtoError::new(ErrorCode::Io, m.to_string())
+}
+
+/// How long the server must keep saying "no such session" without
+/// authentication before the client believes it. One forged answer only
+/// costs a retry; a server that really lost the session (restart) is
+/// detected after this long and the owner reconnects.
+const GONE_GRACE: Duration = Duration::from_secs(10);
+
+/// A refusal that did not come through an authenticated channel (outside
+/// Noise, no valid MAC). Anyone on the path could have forged it, so its
+/// code is not trusted: it is reported as a transient I/O failure, which
+/// makes daemons reconnect instead of giving up.
+fn unauthenticated(e: ProtoError) -> ProtoError {
+    ProtoError::new(
+        ErrorCode::Io,
+        format!("server refused (unauthenticated reply): {e}"),
+    )
 }
 
 fn ws_url(base: &url::Url) -> Result<url::Url, ProtoError> {
@@ -164,16 +183,16 @@ async fn connect_ws(cfg: &ClientConfig, hello: Hello) -> Result<ClientConn, Prot
     ws_send(&mut ws, &WireMsg::Hello { noise: msg1 }).await?;
     let (sid, msg2) = match ws_recv(&mut ws).await? {
         WireMsg::Welcome { sid, noise } => (sid, noise),
-        WireMsg::Reject(e) => return Err(e),
-        _ => return Err(ProtoError::new(ErrorCode::Protocol, "unexpected handshake reply")),
+        WireMsg::Reject(e) => return Err(unauthenticated(e)),
+        _ => return Err(ioe("unexpected handshake reply")),
     };
-    let (noise, welcome, secret) = hs.finish(&msg2)?;
-    let (core, in_rx) = Core::new(noise);
+    let (noise, welcome, keys) = hs.finish(&msg2)?;
+    let (core, in_rx) = Core::new(noise, keys);
     let io = SessionIo::new(core.clone(), in_rx);
     let (resumes_tx, resumes) = watch::channel(0u64);
     let cfg2 = cfg.clone();
     let c2 = core.clone();
-    tokio::spawn(async move { ws_keeper(cfg2, c2, sid, secret, ws, resumes_tx).await });
+    tokio::spawn(async move { ws_keeper(cfg2, c2, sid, ws, resumes_tx).await });
     Ok(ClientConn {
         handle: SessionHandle(core),
         io,
@@ -187,11 +206,14 @@ async fn ws_keeper(
     cfg: ClientConfig,
     core: Arc<Core>,
     sid: String,
-    secret: String,
     first: WsStream,
     resumes: watch::Sender<u64>,
 ) {
     let mut link = Some((first, 0u64));
+    // Resume attempts are numbered; the server only accepts increasing
+    // counters, so a captured request cannot be replayed.
+    let mut ctr = 0u64;
+    let mut gone_since: Option<Instant> = None;
     let mut lost_at: Option<Instant> = None;
     let mut backoff = Duration::from_millis(200);
     // Clients are never superseded; keep the sender alive for the loop.
@@ -235,44 +257,70 @@ async fn ws_keeper(
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(5));
+        ctr += 1;
         let attempt = async {
             let mut ws = ws_dial(&cfg).await?;
+            let ack = core.recv_ack();
+            let ts = mac::now_unix();
+            let proof = mac::request_tag(&core.keys.resume, &sid, "resume", ctr, ts, &ack.to_be_bytes());
             ws_send(
                 &mut ws,
                 &WireMsg::Resume {
                     sid: sid.clone(),
-                    secret: secret.clone(),
-                    ack: core.recv_ack(),
+                    ctr,
+                    ts,
+                    ack,
+                    proof,
                 },
             )
             .await?;
             match ws_recv(&mut ws).await? {
-                WireMsg::Resumed { ack } => Ok((ws, ack)),
-                WireMsg::Reject(e) => Err(e),
-                _ => Err(ProtoError::new(ErrorCode::Protocol, "unexpected resume reply")),
+                WireMsg::Resumed { ack, mac: m }
+                    if mac::check(&core.keys.recv, "resumed", &(ctr, ack), &m) =>
+                {
+                    Ok(Resume::Ok(ws, ack))
+                }
+                WireMsg::Close { err, mac: m } if core.check_close(&err, &m) => Ok(Resume::Closed(err)),
+                // The server does not know the session (e.g. it restarted).
+                // Unauthenticated: end the session as lost, never with the
+                // claimed code, so the owner reconnects.
+                WireMsg::Reject(e) => Ok(Resume::Lost(e)),
+                _ => Err(ioe("unauthenticated or unexpected resume reply")),
             }
         };
         match attempt.await {
-            Ok(l) => {
+            Ok(Resume::Ok(ws, ack)) => {
+                gone_since = None;
                 resumes.send_modify(|n| *n += 1);
-                link = Some(l);
+                link = Some((ws, ack));
             }
-            Err(e) if e.code == ErrorCode::Io || e.code == ErrorCode::Timeout => {
-                tracing::debug!(err = %e, "resume attempt failed");
-            }
-            Err(e) => {
+            Ok(Resume::Closed(e)) => {
                 core.close(e);
                 return;
+            }
+            Ok(Resume::Lost(e)) => {
+                if gone_since.get_or_insert_with(Instant::now).elapsed() >= GONE_GRACE {
+                    core.close(unauthenticated(e));
+                    return;
+                }
+                tracing::debug!(err = %e, "unauthenticated resume refusal; retrying");
+            }
+            Err(e) => {
+                tracing::debug!(err = %e, "resume attempt failed");
             }
         }
     }
 }
 
+enum Resume {
+    Ok(WsStream, u64),
+    Closed(ProtoError),
+    Lost(ProtoError),
+}
+
 // ---------------------------------------------------------------------------
 // HTTP long-polling
 // ---------------------------------------------------------------------------
-
-const SECRET_HEADER: &str = "x-cjs-resume";
 
 fn http_client(cfg: &ClientConfig) -> Result<reqwest::Client, ProtoError> {
     let mut b = reqwest::Client::builder()
@@ -301,20 +349,23 @@ async fn connect_http(cfg: &ClientConfig, hello: Hello) -> Result<ClientConn, Pr
     let status = resp.status();
     let body = resp.bytes().await.map_err(ioe)?;
     if !status.is_success() {
-        return Err(decode::<ProtoError>(&body).unwrap_or_else(|_| ioe(format!("server returned {status}"))));
+        return Err(decode::<ProtoError>(&body)
+            .map(unauthenticated)
+            .unwrap_or_else(|_| ioe(format!("server returned {status}"))));
     }
     let open: HttpOpenResponse = decode(&body)?;
-    let (noise, welcome, secret) = hs.finish(&open.msg)?;
-    let (core, in_rx) = Core::new(noise);
+    let (noise, welcome, keys) = hs.finish(&open.msg)?;
+    let (core, in_rx) = Core::new(noise, keys);
     let io = SessionIo::new(core.clone(), in_rx);
     let (resumes_tx, resumes) = watch::channel(0u64);
     let base = cfg.server.join(&format!("v1/t/{}/", open.sid)).map_err(ioe)?;
     let st = Arc::new(HttpLink {
         http,
         base,
-        secret,
+        sid: open.sid.clone(),
         core: core.clone(),
         resumes: resumes_tx,
+        gone_since: std::sync::Mutex::new(None),
     });
     tokio::spawn(st.clone().tx_loop());
     tokio::spawn(st.rx_loop());
@@ -330,36 +381,74 @@ async fn connect_http(cfg: &ClientConfig, hello: Hello) -> Result<ClientConn, Pr
 struct HttpLink {
     http: reqwest::Client,
     base: url::Url,
-    secret: String,
+    sid: String,
     core: Arc<Core>,
     resumes: watch::Sender<u64>,
+    gone_since: std::sync::Mutex<Option<Instant>>,
 }
 
 enum HttpErr {
+    /// Unauthenticated "session gone": believed only after [`GONE_GRACE`].
+    Gone(ProtoError),
     Transient(ProtoError),
     Fatal(ProtoError),
 }
 
 impl HttpLink {
-    async fn call(&self, req: reqwest::RequestBuilder) -> Result<HttpBatch, HttpErr> {
+    /// Send one request with a proof of possession of the resume key over
+    /// (sid, kind, ctr, ts, H(data)) and check the response MAC.
+    async fn call(
+        &self,
+        kind: &str,
+        ctr: u64,
+        data: &[u8],
+        req: reqwest::RequestBuilder,
+    ) -> Result<HttpBatch, HttpErr> {
+        let auth = mac::auth_header(&self.core.keys.resume, &self.sid, kind, ctr, data);
         let resp = req
-            .header(SECRET_HEADER, &self.secret)
+            .header(HTTP_AUTH_HEADER, auth)
             .send()
             .await
             .map_err(|e| HttpErr::Transient(ioe(e)))?;
         let status = resp.status();
         let body = resp.bytes().await.map_err(|e| HttpErr::Transient(ioe(e)))?;
+        let authentic = |b: &HttpBatch| {
+            b.mac
+                .map(|m| {
+                    mac::check(
+                        &self.core.keys.recv,
+                        "http-resp",
+                        &(kind, ctr, b.ack, &b.closed),
+                        &m,
+                    )
+                })
+                .unwrap_or(false)
+        };
         if status == reqwest::StatusCode::GONE {
-            let e = decode::<HttpBatch>(&body)
-                .ok()
-                .and_then(|b| b.closed)
-                .unwrap_or_else(|| ProtoError::new(ErrorCode::NotFound, "session gone"));
-            return Err(HttpErr::Fatal(e));
+            let b = decode::<HttpBatch>(&body).ok();
+            return Err(HttpErr::Fatal(match b {
+                Some(b) if authentic(&b) => b
+                    .closed
+                    .unwrap_or_else(|| ProtoError::new(ErrorCode::Cancelled, "session closed")),
+                // Unknown session (server restarted) or forged: retried for
+                // a while, the claimed reason is never trusted.
+                b => {
+                    return Err(HttpErr::Gone(
+                        b.and_then(|b| b.closed)
+                            .unwrap_or_else(|| ProtoError::new(ErrorCode::NotFound, "session gone")),
+                    ))
+                }
+            }));
         }
         if !status.is_success() {
             return Err(HttpErr::Transient(ioe(format!("server returned {status}"))));
         }
-        decode(&body).map_err(HttpErr::Fatal)
+        let b: HttpBatch = decode(&body).map_err(HttpErr::Transient)?;
+        if !authentic(&b) {
+            return Err(HttpErr::Transient(ioe("unauthenticated response")));
+        }
+        *self.gone_since.lock().unwrap() = None;
+        Ok(b)
     }
 
     fn fail(&self, e: HttpErr, lost_at: &mut Option<Instant>) -> bool {
@@ -367,6 +456,15 @@ impl HttpLink {
             HttpErr::Fatal(e) => {
                 self.core.close(e);
                 true
+            }
+            HttpErr::Gone(e) => {
+                let mut g = self.gone_since.lock().unwrap();
+                if g.get_or_insert_with(Instant::now).elapsed() >= GONE_GRACE {
+                    self.core.close(unauthenticated(e));
+                    return true;
+                }
+                tracing::debug!(err = %e, "unauthenticated session-gone answer; retrying");
+                false
             }
             HttpErr::Transient(e) => {
                 tracing::debug!(err = %e, "http transport error");
@@ -387,6 +485,7 @@ impl HttpLink {
         let mut ver = self.core.subscribe();
         let mut lost_at = None;
         let mut backoff = Duration::from_millis(200);
+        let mut ctr = 0u64;
         loop {
             let closed = self.core.closed();
             let msgs = self.core.segs_after(posted, 1024 * 1024);
@@ -399,13 +498,16 @@ impl HttpLink {
                 ack: self.core.recv_ack(),
                 msgs,
                 closed: closed.clone(),
+                mac: None,
             };
+            let body = encode(&batch);
+            ctr += 1;
             let req = self
                 .http
                 .post(url.clone())
-                .body(encode(&batch))
+                .body(body.clone())
                 .timeout(Duration::from_secs(30));
-            match self.call(req).await {
+            match self.call("tx", ctr, &body, req).await {
                 Ok(resp) => {
                     if lost_at.take().is_some() {
                         self.resumes.send_modify(|n| *n += 1);
@@ -435,32 +537,36 @@ impl HttpLink {
         let url = self.base.join("rx").expect("url");
         let mut lost_at = None;
         let mut backoff = Duration::from_millis(200);
+        let mut ctr = 0u64;
         loop {
             if self.core.closed().is_some() {
                 return;
             }
+            let ack = self.core.recv_ack();
+            ctr += 1;
             let req = self
                 .http
                 .get(url.clone())
-                .query(&[("ack", self.core.recv_ack())])
+                .query(&[("ack", ack)])
                 .timeout(crate::LONG_POLL + Duration::from_secs(15));
-            match self.call(req).await {
+            match self.call("rx", ctr, &ack.to_be_bytes(), req).await {
                 Ok(batch) => {
                     // A recovered download link counts as a resume too.
                     if lost_at.take().is_some() {
                         self.resumes.send_modify(|n| *n += 1);
                     }
                     backoff = Duration::from_millis(200);
-                    let mut res = self.core.ack(batch.ack);
-                    for (seq, data) in &batch.msgs {
-                        if res.is_err() {
-                            break;
-                        }
-                        res = self.core.receive(*seq, data);
-                    }
-                    if let Err(e) = res {
+                    // The ack is authenticated by the response MAC.
+                    if let Err(e) = self.core.ack(batch.ack) {
                         self.core.close(e);
                         return;
+                    }
+                    for (seq, data) in &batch.msgs {
+                        // A rejected segment only costs a re-poll.
+                        if let Err(e) = self.core.receive(*seq, data) {
+                            tracing::warn!(err = %e, "rejected segment");
+                            break;
+                        }
                     }
                     if let Some(e) = batch.closed {
                         self.core.close(e);

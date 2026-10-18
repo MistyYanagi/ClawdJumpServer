@@ -1,0 +1,156 @@
+//! Regression tests for resource limits and admission races found in the
+//! internal security review.
+#![cfg(unix)]
+use std::time::Duration;
+
+use cjs_mux::write_msg;
+use cjs_proto::Action;
+use cjs_tests::*;
+
+async fn session_end(env: &Env, session: &str) -> cjs_audit::StoredRecord {
+    for _ in 0..100 {
+        let r = env
+            .server
+            .shared
+            .audit
+            .query(&cjs_audit::Query {
+                kind: Some("session.end".into()),
+                session: Some(session.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        if let Some(r) = r.into_iter().next() {
+            return r;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("no session.end for {session}");
+}
+
+/// T3: concurrent opens cannot race past `max_sessions`: decision and
+/// slot reservation are atomic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_sessions_holds_under_concurrent_opens() {
+    let env = Env::start(mode_from_env()).await;
+    let mut g = env.grant("g1", &[Action::Exec]);
+    g.max_sessions = Some(1);
+    env.put_grant(&g);
+    let a = std::sync::Arc::new(env.agent().await);
+    let mut hs = vec![];
+    for _ in 0..8 {
+        let a = a.clone();
+        hs.push(tokio::spawn(async move {
+            a.open(exec_req("dev1", "sleep 2")).await.map(|(s, _)| s)
+        }));
+    }
+    let mut ok = vec![];
+    for h in hs {
+        match h.await.unwrap() {
+            Ok(s) => ok.push(s),
+            Err(e) => assert_eq!(e.code, cjs_proto::ErrorCode::LimitExceeded, "{e}"),
+        }
+    }
+    assert_eq!(ok.len(), 1, "max_sessions=1 admitted {} sessions", ok.len());
+    // The slot is released when the session ends.
+    drop(ok);
+    let mut admitted = false;
+    for _ in 0..100 {
+        if run_exec(&a, exec_req("dev1", "echo again")).await.is_ok() {
+            admitted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(admitted, "slot never released");
+}
+
+/// T2: unauthenticated handshake garbage neither writes one durable audit
+/// row per request nor gets unlimited crypto work: it is rate limited and
+/// the rejections are aggregated into one summary per window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unauthenticated_handshake_flood_is_aggregated() {
+    let env = Env::start(mode_from_env()).await;
+    let before = env.audit_kinds().len();
+    let http = reqwest::Client::new();
+    let mut limited = 0;
+    for _ in 0..200 {
+        let r = http
+            .post(format!("{}v1/t/open", env.url))
+            .body(vec![0u8; 10])
+            .send()
+            .await
+            .unwrap();
+        match r.status().as_u16() {
+            401 => {}
+            429 => limited += 1,
+            s => panic!("unexpected status {s}"),
+        }
+    }
+    assert!(limited >= 150, "rate limit not applied ({limited} limited)");
+    let rows = env.audit_kinds();
+    let added = &rows[before..];
+    assert!(added.len() <= 2, "flood wrote {} audit rows", added.len());
+    assert!(added.iter().any(|(k, _)| k == "gateway.reject"));
+    env.server.shared.flush_rejects(60).unwrap();
+    let summary = env
+        .server
+        .shared
+        .audit
+        .query(&cjs_audit::Query {
+            kind: Some("gateway.reject_summary".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(summary.len(), 1);
+    let suppressed = summary[0].record.event.data["suppressed"].as_u64().unwrap();
+    assert!(suppressed >= 199 - added.len() as u64, "{suppressed}");
+    // A legitimate client from the same address still connects once the
+    // bucket refills.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let a = env.agent().await;
+    assert!(!a.handle.is_closed());
+    // The chain stays verifiable.
+    assert!(env.server.shared.audit.verify(None).unwrap().ok);
+}
+
+/// T4: a terminal session that exceeds the recording size limit is
+/// terminated and the reason is audited; the recording stays bounded and
+/// its audited hash matches the file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recording_size_limit_terminates_session() {
+    let limit = 64 * 1024;
+    let env = Env::start_with(mode_from_env(), |c| c.max_recording_bytes = limit).await;
+    env.put_grant(&env.grant("g1", &[Action::Shell]));
+    let a = env.agent().await;
+    let (mut s, session) = a.open(pty_req("dev1")).await.unwrap();
+    write_msg(
+        &mut s,
+        &cjs_proto::PtyIn::Input(
+            b"i=0; while [ $i -lt 20000 ]; do echo 0123456789abcdef0123456789abcdef; i=$((i+1)); done\n"
+                .to_vec(),
+        ),
+    )
+    .await
+    .unwrap();
+    let out = pty_expect(&mut s, "never-printed", 30).await.unwrap_err();
+    assert!(out.contains("recording size limit"), "{out}");
+    let end = session_end(&env, &session).await;
+    let d = &end.record.event.data;
+    assert_eq!(d["error"]["code"], "limit_exceeded", "{d}");
+    let rec = &d["recording"];
+    let size = rec["size"].as_u64().unwrap();
+    assert!(size <= limit, "{size}");
+    let file = env
+        .server
+        .shared
+        .cfg
+        .recordings_dir
+        .join(rec["file"].as_str().unwrap());
+    let data = std::fs::read(file).unwrap();
+    use sha2::Digest;
+    assert_eq!(data.len() as u64, size);
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(&data)),
+        rec["sha256"].as_str().unwrap()
+    );
+}

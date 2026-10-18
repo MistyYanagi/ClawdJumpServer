@@ -69,6 +69,10 @@ fn io(e: std::io::Error) -> ProtoError {
 }
 
 /// Write a file readable only by the current user.
+///
+/// The mode is enforced on every write, not only at creation: an existing
+/// file with wider permissions is narrowed to 0600 *before* the secret is
+/// written, and any failure to do so is an error.
 pub fn write_secret_file(path: &Path, data: &[u8]) -> Result<(), ProtoError> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
@@ -79,14 +83,23 @@ pub fn write_secret_file(path: &Path, data: &[u8]) -> Result<(), ProtoError> {
         opts.mode(0o600);
     }
     let mut f = opts.open(path).map_err(io)?;
-    // `mode` only applies when the file is created; tighten existing ones.
+    restrict_file(&f)?;
+    f.write_all(data).map_err(io)?;
+    f.sync_all().map_err(io)
+}
+
+/// Set mode 0600 on an open file (no-op on non-Unix platforms, where the
+/// per-user profile directory provides the protection).
+fn restrict_file(f: &std::fs::File) -> Result<(), ProtoError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         f.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(io)?;
     }
-    f.write_all(data).map_err(io)
+    #[cfg(not(unix))]
+    let _ = f;
+    Ok(())
 }
 
 fn x25519_public(private: &[u8; 32]) -> [u8; 32] {
@@ -104,6 +117,25 @@ fn x25519_public(private: &[u8; 32]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_file_mode_is_always_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("cjs-keys-{}", crate::server::random_id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("k");
+        // A pre-existing, world-readable file must be narrowed.
+        std::fs::write(&p, b"old").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_secret_file(&p, b"secret").unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read(&p).unwrap(), b"secret");
+        // Errors are reported, not swallowed.
+        assert!(write_secret_file(&d.join("missing/dir/k"), b"x").is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn public_derivation_matches() {

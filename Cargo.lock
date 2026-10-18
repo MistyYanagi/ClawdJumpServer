@@ -532,6 +532,7 @@ dependencies = [
 name = "cjs-ctl"
 version = "0.1.0"
 dependencies = [
+ "cjs-audit",
  "cjs-proto",
  "cjs-transport",
  "clap",
@@ -689,6 +690,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "blake3",
  "bytes",
  "cjs-mux",
  "cjs-proto",
