@@ -2,13 +2,14 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use cjs_authz::{FullAccess, Grant, Role};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use cjs_authz::{ApprovalStatus, FullAccess, Grant, Role, RoleChange};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 
-const SCHEMA: &[&str] = &[r#"
+const SCHEMA: &[&str] = &[
+    r#"
 CREATE TABLE users (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -93,7 +94,23 @@ CREATE TABLE settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-"#];
+"#,
+    r#"
+CREATE TABLE role_changes (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending',
+    body TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX role_changes_status ON role_changes(status);
+CREATE TABLE revoked_keys (
+    pubkey TEXT PRIMARY KEY,
+    principal TEXT NOT NULL,
+    revoked_at INTEGER NOT NULL
+);
+"#,
+];
 
 pub fn now() -> i64 {
     std::time::SystemTime::now()
@@ -137,19 +154,103 @@ impl User {
         self.roles.contains(&r)
     }
 
-    /// Active = enabled, not expired, not locked.
+    /// Usable for a new login = enabled, not expired, not locked.
     pub fn usable(&self, now: i64) -> Result<(), &'static str> {
+        self.active(now)?;
+        if self.locked_until.map(|l| now < l).unwrap_or(false) {
+            return Err("account locked");
+        }
+        Ok(())
+    }
+
+    /// Enabled and not expired. A login lockout only blocks new logins, so
+    /// existing sessions only need this.
+    pub fn active(&self, now: i64) -> Result<(), &'static str> {
         if self.status != "active" {
             return Err("account disabled");
         }
         if self.expires_at.map(|e| now >= e).unwrap_or(false) {
             return Err("account expired");
         }
-        if self.locked_until.map(|l| now < l).unwrap_or(false) {
-            return Err("account locked");
-        }
         Ok(())
     }
+
+    fn holds(&self, r: Role, now: i64) -> bool {
+        self.has(r) && self.active(now).is_ok()
+    }
+
+    fn apply(&mut self, p: &UserPatch) {
+        if let Some(s) = p.status {
+            self.status = s.into();
+        }
+        if let Some(r) = p.roles {
+            self.roles = r.to_vec();
+        }
+        if let Some(d) = p.display_name {
+            self.display_name = d.into();
+        }
+        if let Some(e) = p.expires_at {
+            self.expires_at = e;
+        }
+    }
+}
+
+/// Column changes an administrator can make to a user.
+#[derive(Debug, Default, Clone)]
+pub struct UserPatch<'a> {
+    pub status: Option<&'a str>,
+    pub roles: Option<&'a [Role]>,
+    pub display_name: Option<&'a str>,
+    /// `Some(None)` clears the expiry.
+    pub expires_at: Option<Option<i64>>,
+}
+
+/// What an enrollment creates.
+#[derive(Debug, Clone, Copy)]
+pub enum Enrollee<'a> {
+    Agent(&'a Agent),
+    Device(&'a Device),
+}
+
+/// Last-holder protection: `before` -> `after` must not leave a role in
+/// [`cjs_authz::LAST_HOLDER_ROLES`] without an active holder.
+fn last_holder_guard(c: &Connection, before: &User, after: &User, t: i64) -> R<()> {
+    for r in cjs_authz::LAST_HOLDER_ROLES {
+        if !before.holds(r, t) {
+            continue;
+        }
+        let keeps = after.has(r)
+            && after.status == "active"
+            && (after.expires_at.is_none() || after.expires_at == before.expires_at);
+        if keeps {
+            continue;
+        }
+        let others = {
+            let mut st = c.prepare("SELECT * FROM users WHERE id != ?1")?;
+            let rows = st.query_map([&before.id], user_row)?;
+            rows.collect::<rusqlite::Result<Vec<User>>>()?
+        };
+        if !others.iter().any(|u| u.holds(r, t)) {
+            return Err(ApiError::new(
+                cjs_proto::ErrorCode::Conflict,
+                format!(
+                    "{} is the last active {}: it cannot be disabled, expired or lose that role",
+                    before.name,
+                    r.as_str()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn same_roles(a: &[Role], b: &[Role]) -> bool {
+    let (mut a, mut b) = (a.to_vec(), b.to_vec());
+    a.sort();
+    a.dedup();
+    b.sort();
+    b.dedup();
+    a == b
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -353,29 +454,212 @@ impl Db {
         Ok(v)
     }
 
-    pub fn update_user(&self, u: &User) -> R<()> {
-        self.with(|c| {
-            c.execute(
-                "UPDATE users SET display_name=?2, password_hash=?3, totp_secret=?4, roles=?5, status=?6,
-                 failed_logins=?7, locked_until=?8, expires_at=?9, last_login=?10, last_ip=?11, last_totp_step=?12
-                 WHERE id=?1",
-                params![
-                    u.id,
-                    u.display_name,
-                    u.password_hash,
-                    u.totp_secret,
-                    roles_to(&u.roles),
-                    u.status,
-                    u.failed_logins,
-                    u.locked_until,
-                    u.expires_at,
-                    u.last_login,
-                    u.last_ip,
-                    u.last_totp_step
-                ],
+    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn user_in(c: &Connection, id: &str) -> R<User> {
+        c.query_row("SELECT * FROM users WHERE id = ?1", [id], user_row)
+            .optional()?
+            .ok_or_else(|| ApiError::not_found("no such user"))
+    }
+
+    // Logins and credential changes touch only their own columns with
+    // conditional SQL, so a concurrent administrative change (disable,
+    // reset) is never overwritten by a stale snapshot.
+
+    /// Reserve one login attempt before the credentials are checked.
+    /// Returns `None` if the account is locked, otherwise whether this
+    /// attempt used up the last allowed failure and locked the account
+    /// (a successful attempt lifts the lock again, see [`Db::claim_login`]).
+    pub fn reserve_login_attempt(
+        &self,
+        id: &str,
+        t: i64,
+        max_failures: i64,
+        lock_secs: i64,
+    ) -> R<Option<bool>> {
+        let c = self.lock();
+        let r: Option<Option<i64>> = c
+            .query_row(
+                "UPDATE users SET
+                    failed_logins = CASE WHEN failed_logins + 1 >= ?3 THEN 0 ELSE failed_logins + 1 END,
+                    locked_until = CASE WHEN failed_logins + 1 >= ?3 THEN ?2 + ?4 ELSE NULL END
+                 WHERE id = ?1 AND (locked_until IS NULL OR locked_until <= ?2)
+                 RETURNING locked_until",
+                params![id, t, max_failures, lock_secs],
+                |r| r.get(0),
             )
-            .map(|_| ())
+            .optional()?;
+        Ok(r.map(|l| l.is_some()))
+    }
+
+    /// Accept a verified login: record the TOTP step (only if it is newer
+    /// than the last accepted one, so a code is accepted once even under
+    /// concurrency) and clear the failure counter. The password hash, TOTP
+    /// secret and status must still be the ones that were verified.
+    /// Returns false on replay or a concurrent change.
+    pub fn claim_login(&self, u: &User, step: i64) -> R<bool> {
+        let c = self.lock();
+        let n = c.execute(
+            "UPDATE users SET last_totp_step = ?2, failed_logins = 0, locked_until = NULL
+             WHERE id = ?1 AND last_totp_step < ?2 AND password_hash = ?3 AND totp_secret = ?4 AND status = 'active'",
+            params![u.id, step, u.password_hash, u.totp_secret],
+        )?;
+        Ok(n == 1)
+    }
+
+    pub fn record_login(&self, id: &str, t: i64, ip: Option<&str>) -> R<()> {
+        let c = self.lock();
+        c.execute(
+            "UPDATE users SET last_login = ?2, last_ip = ?3 WHERE id = ?1",
+            params![id, t, ip],
+        )?;
+        Ok(())
+    }
+
+    /// Replace the password hash, but only if it is still `old_hash`.
+    pub fn set_password(&self, id: &str, old_hash: &str, new_hash: &str) -> R<bool> {
+        let c = self.lock();
+        let n = c.execute(
+            "UPDATE users SET password_hash = ?3 WHERE id = ?1 AND password_hash = ?2",
+            params![id, old_hash, new_hash],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// New password and TOTP secret (administrative reset).
+    pub fn reset_credentials(&self, id: &str, hash: &str, secret: &str) -> R<()> {
+        let c = self.lock();
+        c.execute(
+            "UPDATE users SET password_hash = ?2, totp_secret = ?3, last_totp_step = 0,
+             failed_logins = 0, locked_until = NULL WHERE id = ?1",
+            params![id, hash, secret],
+        )?;
+        Ok(())
+    }
+
+    pub fn unlock_user(&self, id: &str) -> R<()> {
+        let c = self.lock();
+        c.execute(
+            "UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    /// Apply an administrative change in one transaction, with last-holder
+    /// protection. Returns the updated user (without groups).
+    pub fn patch_user(&self, id: &str, p: &UserPatch, t: i64) -> R<User> {
+        let c = self.lock();
+        let tx = Transaction::new_unchecked(&c, TransactionBehavior::Immediate)?;
+        let before = Self::user_in(&tx, id)?;
+        let mut after = before.clone();
+        after.apply(p);
+        last_holder_guard(&tx, &before, &after, t)?;
+        tx.execute(
+            "UPDATE users SET status = ?2, roles = ?3, display_name = ?4, expires_at = ?5 WHERE id = ?1",
+            params![
+                after.id,
+                after.status,
+                roles_to(&after.roles),
+                after.display_name,
+                after.expires_at
+            ],
+        )?;
+        tx.commit()?;
+        Ok(after)
+    }
+
+    // ---- role changes (two-person rule for privileged roles) ---------------
+
+    pub fn insert_role_change(&self, rc: &RoleChange) -> R<()> {
+        let body = serde_json::to_string(rc).map_err(|e| ApiError::internal(e.to_string()))?;
+        let c = self.lock();
+        c.execute(
+            "INSERT INTO role_changes (id, user_id, status, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![rc.id, rc.user_id, rc.status.as_str(), body, rc.created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn role_changes(&self) -> R<Vec<RoleChange>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT body FROM role_changes ORDER BY created_at DESC LIMIT 500")?;
+            let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for r in rows {
+                if let Ok(rc) = serde_json::from_str(&r?) {
+                    out.push(rc);
+                }
+            }
+            Ok(out)
         })
+    }
+
+    pub fn role_change(&self, id: &str) -> R<Option<RoleChange>> {
+        let body: Option<String> = self.with(|c| {
+            c.query_row("SELECT body FROM role_changes WHERE id = ?1", [id], |r| r.get(0))
+                .optional()
+        })?;
+        Ok(body.and_then(|b| serde_json::from_str(&b).ok()))
+    }
+
+    fn store_decision(c: &Connection, rc: &RoleChange) -> R<bool> {
+        let body = serde_json::to_string(rc).map_err(|e| ApiError::internal(e.to_string()))?;
+        let n = c.execute(
+            "UPDATE role_changes SET status = ?2, body = ?3 WHERE id = ?1 AND status = 'pending'",
+            params![rc.id, rc.status.as_str(), body],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Record a rejection of a pending change. False if it was no longer
+    /// pending.
+    pub fn reject_role_change(&self, rc: &RoleChange) -> R<bool> {
+        let c = self.lock();
+        Self::store_decision(&c, rc)
+    }
+
+    /// Apply an approved change (`rc.status` already `Approved`) and mark it
+    /// decided, atomically. Refused if the change is no longer pending, the
+    /// user's roles changed since the request, or a last holder would lose
+    /// its role.
+    pub fn apply_role_change(&self, rc: &RoleChange, t: i64) -> R<User> {
+        let c = self.lock();
+        let tx = Transaction::new_unchecked(&c, TransactionBehavior::Immediate)?;
+        let before = Self::user_in(&tx, &rc.user_id)?;
+        if !same_roles(&before.roles, &rc.from_roles) {
+            return Err(ApiError::new(
+                cjs_proto::ErrorCode::Conflict,
+                "the user's roles changed since this request; request again",
+            ));
+        }
+        let mut after = before.clone();
+        after.roles = rc.roles.clone();
+        last_holder_guard(&tx, &before, &after, t)?;
+        if !Self::store_decision(&tx, rc)? {
+            return Err(ApiError::new(
+                cjs_proto::ErrorCode::Conflict,
+                "request is no longer pending",
+            ));
+        }
+        tx.execute(
+            "UPDATE users SET roles = ?2 WHERE id = ?1",
+            params![after.id, roles_to(&after.roles)],
+        )?;
+        tx.commit()?;
+        Ok(after)
+    }
+
+    /// Server-local (CLI) role assignment: no approval, no guard.
+    pub fn set_roles_local(&self, id: &str, roles: &[Role]) -> R<()> {
+        let c = self.lock();
+        c.execute(
+            "UPDATE users SET roles = ?2 WHERE id = ?1",
+            params![id, roles_to(roles)],
+        )?;
+        Ok(())
     }
 
     pub fn count_users(&self) -> R<i64> {
@@ -441,8 +725,15 @@ impl Db {
         })
     }
 
+    /// Delete an agent. If it was disabled its key is revoked, so it
+    /// cannot come back through a new enrollment token.
     pub fn delete_agent(&self, id: &str) -> R<()> {
         self.with(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO revoked_keys (pubkey, principal, revoked_at)
+                 SELECT pubkey, id, ?2 FROM agents WHERE id=?1 AND status != 'active'",
+                params![id, now()],
+            )?;
             c.execute("DELETE FROM group_members WHERE member_id=?1", [id])?;
             c.execute("DELETE FROM agents WHERE id=?1", [id]).map(|_| ())
         })
@@ -515,8 +806,15 @@ impl Db {
         })
     }
 
+    /// Delete a device; a disabled device's key is revoked (see
+    /// [`Db::delete_agent`]).
     pub fn delete_device(&self, id: &str) -> R<()> {
         self.with(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO revoked_keys (pubkey, principal, revoked_at)
+                 SELECT pubkey, id, ?2 FROM devices WHERE id=?1 AND status != 'active'",
+                params![id, now()],
+            )?;
             c.execute("DELETE FROM group_members WHERE member_id=?1", [id])?;
             c.execute("DELETE FROM devices WHERE id=?1", [id]).map(|_| ())
         })
@@ -656,6 +954,67 @@ impl Db {
         })
     }
 
+    /// Redeem an enrollment token: mark it used and create the agent or
+    /// device in one transaction. `before_commit` runs after both writes
+    /// succeeded and before the commit (the caller audits there; an error
+    /// rolls everything back). Refuses a key that is already enrolled or was
+    /// revoked.
+    pub fn enroll_principal(
+        &self,
+        token_id: &str,
+        who: Enrollee,
+        before_commit: impl FnOnce() -> R<()>,
+    ) -> R<()> {
+        use cjs_proto::ErrorCode;
+        let (id, pubkey) = match who {
+            Enrollee::Agent(a) => (&a.id, &a.pubkey),
+            Enrollee::Device(d) => (&d.id, &d.pubkey),
+        };
+        let c = self.lock();
+        let tx = Transaction::new_unchecked(&c, TransactionBehavior::Immediate)?;
+        let known: i64 = tx.query_row(
+            "SELECT (SELECT COUNT(*) FROM revoked_keys WHERE pubkey = ?1)
+                  + (SELECT COUNT(*) FROM agents WHERE pubkey = ?1)
+                  + (SELECT COUNT(*) FROM devices WHERE pubkey = ?1)",
+            [pubkey],
+            |r| r.get(0),
+        )?;
+        if known > 0 {
+            return Err(ApiError::new(
+                ErrorCode::Forbidden,
+                "this key is revoked or already enrolled",
+            ));
+        }
+        let n = tx.execute(
+            "UPDATE enroll_tokens SET used_at=?2, used_by=?3 WHERE id=?1 AND used_at IS NULL",
+            params![token_id, now(), id],
+        )?;
+        if n != 1 {
+            return Err(ApiError::new(ErrorCode::Replay, "enrollment token already used"));
+        }
+        let ins = match who {
+            Enrollee::Agent(a) => tx.execute(
+                "INSERT INTO agents (id, name, owner_id, pubkey, status, expires_at, info, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![a.id, a.name, a.owner_id, a.pubkey, a.status, a.expires_at, a.info.to_string(), a.created_at],
+            ),
+            Enrollee::Device(d) => tx.execute(
+                "INSERT INTO devices (id, name, pubkey, status, info, created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![d.id, d.name, d.pubkey, d.status, d.info.to_string(), d.created_at],
+            ),
+        };
+        if let Err(e) = ins {
+            let e = ApiError::from(e);
+            return Err(if e.code == ErrorCode::Conflict {
+                ApiError::new(ErrorCode::Conflict, "name already enrolled")
+            } else {
+                e
+            });
+        }
+        before_commit()?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Atomically mark a token used. Returns false if it was already used.
     pub fn consume_enroll_token(&self, id: &str, used_by: &str) -> R<bool> {
         self.with(|c| {
@@ -739,6 +1098,19 @@ impl Db {
         Ok(self.full_access_all()?.into_iter().find(|f| f.id == id))
     }
 
+    /// Store a decision on a request only if it is still in state `from`
+    /// (so concurrent approve / reject / revoke cannot overwrite each other).
+    pub fn transition_full_access(&self, f: &FullAccess, from: ApprovalStatus) -> R<bool> {
+        let body = serde_json::to_string(f).map_err(|e| ApiError::internal(e.to_string()))?;
+        self.with(|c| {
+            c.execute(
+                "UPDATE full_access SET body=?2 WHERE id=?1 AND json_extract(body, '$.status') = ?3",
+                params![f.id, body, from.as_str()],
+            )
+            .map(|n| n == 1)
+        })
+    }
+
     pub fn put_full_access(&self, f: &FullAccess) -> R<()> {
         let body = serde_json::to_string(f).map_err(|e| ApiError::internal(e.to_string()))?;
         self.with(|c| {
@@ -790,6 +1162,17 @@ impl Db {
         self.with(|c| {
             c.execute("DELETE FROM web_sessions WHERE token_hash=?1", [token_hash])
                 .map(|_| ())
+        })
+    }
+
+    /// Drop sessions past their idle or absolute timeout.
+    pub fn purge_web_sessions(&self, idle_secs: i64, max_secs: i64) -> R<usize> {
+        let t = now();
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM web_sessions WHERE last_seen < ?1 OR created_at < ?2",
+                params![t - idle_secs, t - max_secs],
+            )
         })
     }
 

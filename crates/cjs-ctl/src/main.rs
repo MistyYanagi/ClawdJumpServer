@@ -51,6 +51,9 @@ enum Cmd {
     Grants(GrantCmd),
     #[command(subcommand, name = "full-access")]
     FullAccess(FullCmd),
+    /// Role grants waiting for a second person (secadmin) to approve.
+    #[command(subcommand, name = "role-changes")]
+    RoleChanges(RoleChangeCmd),
     #[command(subcommand)]
     Live(LiveCmd),
     #[command(subcommand)]
@@ -83,7 +86,8 @@ enum UserCmd {
     Enable {
         user: String,
     },
-    /// Replace a user's roles.
+    /// Replace a user's roles. Granting a role creates a pending request
+    /// that another secadmin approves (`cjsctl role-changes approve`).
     Roles {
         user: String,
         #[arg(value_delimiter = ',')]
@@ -186,6 +190,19 @@ enum FullCmd {
 }
 
 #[derive(Subcommand)]
+enum RoleChangeCmd {
+    List,
+    /// Approve (secadmin; not the requester, not the user concerned).
+    Approve {
+        id: String,
+    },
+    /// Reject (secadmin) or withdraw your own request.
+    Reject {
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum LiveCmd {
     Connections,
     Streams,
@@ -224,9 +241,23 @@ enum AuditCmd {
 #[derive(Serialize, Deserialize)]
 struct Session {
     server: String,
+    /// Cookie name (`__Host-cjs_session` over TLS, else `cjs_session`).
+    #[serde(default = "default_cookie_name")]
+    cookie_name: String,
     cookie: String,
     csrf: String,
     ca: Option<PathBuf>,
+}
+
+fn default_cookie_name() -> String {
+    "cjs_session".into()
+}
+
+/// Session cookie from a `Set-Cookie` value: (name, value).
+fn session_cookie(set_cookie: &str) -> Option<(String, String)> {
+    let first = set_cookie.split(';').next()?.trim();
+    let (k, v) = first.split_once('=')?;
+    (k == "cjs_session" || k == "__Host-cjs_session").then(|| (k.to_string(), v.to_string()))
 }
 
 fn die(m: impl std::fmt::Display) -> ! {
@@ -290,7 +321,7 @@ impl Api {
         let mut r = self
             .http
             .request(method.clone(), self.url(path))
-            .header("cookie", format!("cjs_session={}", self.s.cookie));
+            .header("cookie", format!("{}={}", self.s.cookie_name, self.s.cookie));
         if method != reqwest::Method::GET {
             r = r.header("x-csrf-token", &self.s.csrf);
         }
@@ -383,10 +414,7 @@ async fn main() {
                 .get_all("set-cookie")
                 .iter()
                 .filter_map(|v| v.to_str().ok())
-                .find_map(|c| {
-                    c.strip_prefix("cjs_session=")
-                        .map(|r| r.split(';').next().unwrap_or("").to_string())
-                });
+                .find_map(session_cookie);
             let ok = resp.status().is_success();
             let v: Value = resp.json().await.unwrap_or(json!({}));
             if !ok {
@@ -396,9 +424,11 @@ async fn main() {
                     v["error"]["message"].as_str().unwrap_or("")
                 ));
             }
+            let (cookie_name, cookie) = cookie.unwrap_or_else(|| die("server did not set a session cookie"));
             let s = Session {
                 server: server.clone(),
-                cookie: cookie.unwrap_or_else(|| die("server did not set a session cookie")),
+                cookie_name,
+                cookie,
                 csrf: v["csrf"].as_str().unwrap_or_default().to_string(),
                 ca: ca.as_ref().map(|p| {
                     std::fs::canonicalize(p).unwrap_or_else(|e| die(format!("{}: {e}", p.display())))
@@ -543,6 +573,11 @@ async fn run(api: &Api, cmd: &Cmd) {
             FullCmd::Reject { id } => api.post(&format!("/full-access/{}/reject", enc(id)), json!({})).await,
             FullCmd::Revoke { id } => api.post(&format!("/full-access/{}/revoke", enc(id)), json!({})).await,
         },
+        Cmd::RoleChanges(c) => match c {
+            RoleChangeCmd::List => api.get("/role-changes").await,
+            RoleChangeCmd::Approve { id } => api.post(&format!("/role-changes/{}/approve", enc(id)), json!({})).await,
+            RoleChangeCmd::Reject { id } => api.post(&format!("/role-changes/{}/reject", enc(id)), json!({})).await,
+        },
         Cmd::Live(c) => match c {
             LiveCmd::Connections => api.get("/live/connections").await,
             LiveCmd::Streams => api.get("/live/streams").await,
@@ -616,5 +651,23 @@ fn write_out(path: Option<&PathBuf>, data: &[u8]) {
             use std::io::Write;
             let _ = std::io::stdout().write_all(data);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_both_cookie_names() {
+        assert_eq!(
+            session_cookie("__Host-cjs_session=abc; Path=/; Secure"),
+            Some(("__Host-cjs_session".into(), "abc".into()))
+        );
+        assert_eq!(
+            session_cookie("cjs_session=xyz; Path=/"),
+            Some(("cjs_session".into(), "xyz".into()))
+        );
+        assert_eq!(session_cookie("other=1"), None);
     }
 }

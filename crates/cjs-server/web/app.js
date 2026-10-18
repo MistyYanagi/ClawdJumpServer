@@ -93,7 +93,7 @@ const views = {
   users: { label: "Users", roles: ["sysadmin"], render: users },
   groups: { label: "Groups", roles: null, render: groups },
   grants: { label: "Grants", roles: ["secadmin", "auditor"], render: grants },
-  full: { label: "Full access", roles: null, render: fullAccess },
+  full: { label: "Approvals", roles: null, render: fullAccess },
   audit: { label: "Audit", roles: ["auditor"], render: audit },
   account: { label: "Account", roles: null, render: account },
 };
@@ -138,7 +138,7 @@ async function agents(v) {
     ["Host", (a) => a.info && a.info.hostname ? a.info.hostname : ""], ["Last seen", (a) => ts(a.last_seen)],
     ["", (a) => [
       (has("sysadmin") || a.status === "active") ? btn(a.status === "active" ? "Disable" : "Enable", async () => { await api("PATCH", `/agents/${a.id}`, { status: a.status === "active" ? "disabled" : "active" }); go("agents"); }) : "",
-      btn("Delete", async () => { if (confirm(`Delete agent ${a.name}?`)) { await api("DELETE", `/agents/${a.id}`); go("agents"); } }, "danger"),
+      (has("sysadmin") || a.status === "active") && btn("Delete", async () => { if (confirm(`Delete agent ${a.name}?`)) { await api("DELETE", `/agents/${a.id}`); go("agents"); } }, "danger"),
     ], "actions"],
   ], list, "No agents.")));
 }
@@ -178,7 +178,8 @@ async function users(v) {
     const roles = ["sysadmin", "secadmin", "auditor"].filter((r) => form.elements["r_" + r].checked);
     try {
       const r = await api("POST", "/users", { name: f.name, display_name: f.display_name || undefined, roles });
-      state.flash = secretBox("Initial credentials", { user: r.user.name, password: r.password, totp_secret: r.totp_secret, otpauth_url: r.otpauth_url });
+      state.flash = secretBox("Initial credentials", { user: r.user.name, password: r.password, totp_secret: r.totp_secret, otpauth_url: r.otpauth_url,
+        pending_roles: r.pending_role_change ? r.pending_role_change.roles.join(", ") + " (waits for approval by another secadmin)" : undefined });
       go("users", true);
     } catch (e) { toast(e.message); }
   } },
@@ -186,7 +187,7 @@ async function users(v) {
     el("label", {}, "Display name", el("input", { name: "display_name" })),
     ...["sysadmin", "secadmin", "auditor"].map((r) => el("label", {}, el("input", { type: "checkbox", name: "r_" + r }), r)),
     el("button", { type: "submit" }, "Create user"));
-  v.append(card("New user", el("p", { class: "muted" }, "secadmin and auditor cannot be combined (separation of duties)."), form, out));
+  v.append(card("New user", el("p", { class: "muted" }, "secadmin and auditor cannot be combined (separation of duties). Roles take effect only after another secadmin approves them (Approvals)."), form, out));
   const list = await api("GET", "/users");
   v.append(card("Users", table([
     ["Name", (u) => u.name], ["Roles", (u) => u.roles.join(", ")], ["State", (u) => [status(u.status), u.locked_until && u.locked_until * 1000 > Date.now() ? pill("locked", "bad") : ""]],
@@ -196,10 +197,12 @@ async function users(v) {
       btn("Roles…", async () => {
         const r = prompt("Roles (comma separated: sysadmin, secadmin, auditor)", u.roles.join(","));
         if (r === null) return;
-        await api("PATCH", `/users/${u.id}`, { roles: r.split(",").map((x) => x.trim()).filter(Boolean) }); go("users");
+        const res = await api("PATCH", `/users/${u.id}`, { roles: r.split(",").map((x) => x.trim()).filter(Boolean) });
+        if (res.pending_role_change) toast("role change requested: needs approval by another secadmin");
+        go("users");
       }),
       btn("Unlock", async () => { await api("POST", `/users/${u.id}/unlock`); toast("unlocked"); }),
-      btn("Reset", async () => {
+      u.roles.length ? "" : btn("Reset", async () => {
         if (!confirm(`Reset password and authenticator of ${u.name}?`)) return;
         const r = await api("POST", `/users/${u.id}/reset`);
         out.replaceChildren(secretBox("New credentials", { user: u.name, password: r.password, totp_secret: r.totp_secret, otpauth_url: r.otpauth_url }));
@@ -283,8 +286,20 @@ async function fullAccess(v) {
     el("label", {}, "Minutes (max 480)", el("input", { name: "duration", type: "number", value: "60", min: "1", max: "480" })),
     el("button", { type: "submit" }, "Request"));
   v.append(card("Request full access", el("p", { class: "muted" }, "Lifts the project-root jail and the sandbox. Needs approval by a different secadmin and always expires."), form));
+  if (has("sysadmin") || has("secadmin") || has("auditor")) {
+    const rcs = await api("GET", "/role-changes");
+    v.append(card("Role changes", el("p", { class: "muted" }, "Granting a role needs a secadmin other than the requester and the user concerned."), table([
+      ["User", (r) => r.user_name], ["From", (r) => r.from_roles.join(", ") || "none"], ["To", (r) => r.roles.join(", ") || "none"],
+      ["Requested by", (r) => r.requested_by], ["Requested", (r) => ts(r.created_at)], ["State", (r) => status(r.status)],
+      ["Decided by", (r) => r.decided_by || ""],
+      ["", (r) => r.status !== "pending" ? "" : [
+        has("secadmin") && r.requested_by !== state.user.id && r.user_id !== state.user.id ? btn("Approve", async () => { await api("POST", `/role-changes/${r.id}/approve`); go("full"); }, "") : "",
+        has("secadmin") || r.requested_by === state.user.id ? btn(r.requested_by === state.user.id ? "Withdraw" : "Reject", async () => { await api("POST", `/role-changes/${r.id}/reject`); go("full"); }) : "",
+      ], "actions"],
+    ], rcs, "No role changes.")));
+  }
   const list = await api("GET", "/full-access");
-  v.append(card("Requests", table([
+  v.append(card("Full-access requests", table([
     ["Agent", (f) => f.principal], ["Device", (f) => f.device], ["Reason", (f) => f.reason],
     ["Requested by", (f) => f.requested_by], ["State", (f) => status(f.status)],
     ["Approved by", (f) => f.approved_by || ""], ["Expires", (f) => ts(f.expires_at)],

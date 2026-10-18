@@ -59,6 +59,27 @@ enum Cmd {
         #[arg(long, default_value_t = 86400)]
         ttl: i64,
     },
+    /// Create a user with roles directly (host operator; no approval).
+    /// Prints the initial password and TOTP secret.
+    UserAdd {
+        name: String,
+        /// sysadmin, secadmin, auditor (comma separated)
+        #[arg(long, value_delimiter = ',')]
+        roles: Vec<String>,
+    },
+    /// Set a user's roles directly (host operator; no approval).
+    UserRole {
+        /// User name or id.
+        user: String,
+        /// New complete role set (comma separated; empty for none).
+        #[arg(value_delimiter = ',', default_value = "")]
+        roles: Vec<String>,
+    },
+    /// Reset a user's password and TOTP secret (any user, incl. administrators).
+    ResetUser {
+        /// User name or id.
+        user: String,
+    },
     /// Verify the audit log's hash chain and checkpoint signatures.
     AuditVerify,
     /// Print the server's public keys.
@@ -131,6 +152,60 @@ fn main() {
                 );
                 println!("{token}");
             }
+            Cmd::UserAdd { name, roles } => {
+                let (_, db, audit) = open(&cli.data);
+                let roles = parse_roles(&roles);
+                let nu = accounts::create_user(&name, roles.clone(), None).unwrap_or_else(|e| die(e));
+                if db.user(&name).unwrap_or_else(|e| die(e)).is_some() {
+                    die("user exists");
+                }
+                cli_audit(
+                    &audit,
+                    "admin.user.create",
+                    &nu.user.id,
+                    serde_json::json!({"name": name, "roles": roles}),
+                );
+                db.insert_user(&nu.user).unwrap_or_else(|e| die(e));
+                print_credentials(&name, &nu.password, &nu.totp_secret);
+            }
+            Cmd::UserRole { user, roles } => {
+                let (_, db, audit) = open(&cli.data);
+                let roles = parse_roles(&roles);
+                cjs_authz::validate_roles(&roles).unwrap_or_else(|e| die(e));
+                let u = db
+                    .user(&user)
+                    .unwrap_or_else(|e| die(e))
+                    .unwrap_or_else(|| die("no such user"));
+                cli_audit(
+                    &audit,
+                    "admin.user.update",
+                    &u.id,
+                    serde_json::json!({"name": u.name, "roles": roles, "from_roles": u.roles}),
+                );
+                db.set_roles_local(&u.id, &roles).unwrap_or_else(|e| die(e));
+                let names: Vec<_> = roles.iter().map(|r| r.as_str()).collect();
+                println!("{}: roles = {}", u.name, names.join(","));
+            }
+            Cmd::ResetUser { user } => {
+                let (_, db, audit) = open(&cli.data);
+                let u = db
+                    .user(&user)
+                    .unwrap_or_else(|e| die(e))
+                    .unwrap_or_else(|| die("no such user"));
+                let password = accounts::random_password();
+                let secret = accounts::new_totp_secret();
+                cli_audit(
+                    &audit,
+                    "admin.user.reset",
+                    &u.id,
+                    serde_json::json!({"name": u.name}),
+                );
+                let hash = accounts::hash_password(&password).unwrap_or_else(|e| die(e));
+                db.reset_credentials(&u.id, &hash, &secret)
+                    .unwrap_or_else(|e| die(e));
+                db.delete_user_sessions(&u.id).unwrap_or_else(|e| die(e));
+                print_credentials(&u.name, &password, &secret);
+            }
             Cmd::AuditVerify => {
                 let keys = Keys::load_or_create(&cli.data).unwrap_or_else(|e| die(e));
                 let r = cjs_audit::verify_file(&cli.data.join("audit.db"), &keys.audit.verifying_key())
@@ -155,6 +230,32 @@ fn main() {
             }
         }
     });
+}
+
+fn parse_roles(v: &[String]) -> Vec<cjs_authz::Role> {
+    v.iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| cjs_authz::Role::parse(s).unwrap_or_else(|| die(format!("unknown role {s}"))))
+        .collect()
+}
+
+/// Audit a host-operator action; refuse if the audit write fails.
+fn cli_audit(audit: &cjs_audit::AuditLog, kind: &str, target: &str, data: serde_json::Value) {
+    audit
+        .append(
+            cjs_audit::Event::new(kind, "system:cli", target, cjs_audit::Outcome::Success)
+                .highlight(true)
+                .data(data),
+        )
+        .unwrap_or_else(|e| die(e));
+}
+
+fn print_credentials(name: &str, password: &str, secret: &str) {
+    println!("user:           {name}");
+    println!("password:       {password}");
+    println!("TOTP secret:    {secret}");
+    println!("TOTP URL:       {}", accounts::otpauth_url(secret, name));
 }
 
 fn init(data: &Path, admin: &str, hostnames: Vec<String>) {
@@ -208,7 +309,10 @@ fn init(data: &Path, admin: &str, hostnames: Vec<String>) {
         hostnames.join(", ")
     );
     println!();
-    println!("Next: create an auditor and a second secadmin (two-person rule), e.g. with cjsctl.");
+    println!("Next: create an auditor and a second secadmin on this host, e.g.");
+    println!("  cjs-server user-add audit1 --roles auditor");
+    println!("  cjs-server user-add sec2 --roles secadmin");
+    println!("Through the API, granting a role needs approval by another secadmin.");
 }
 
 fn load_tls(cert: &Path, key: &Path) -> Arc<rustls::ServerConfig> {
