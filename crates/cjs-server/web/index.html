@@ -10,13 +10,19 @@
 <body>
 <header id="top" hidden>
   <strong class="brand">ClawdJumpServer</strong>
-  <nav id="nav"></nav>
-  <span id="who"></span>
-  <button id="logout" type="button">Log out</button>
+  <nav id="nav" aria-label="Main"></nav>
+  <div class="tools">
+    <span id="chain-badge"></span>
+    <button id="palette-btn" class="search" type="button" aria-haspopup="dialog" aria-keyshortcuts="Control+K Meta+K"><span>Search…</span> <kbd id="palette-kbd">Ctrl K</kbd></button>
+    <button id="theme" class="ghost" type="button"></button>
+    <span id="who"></span>
+    <button id="logout" class="secondary" type="button">Log out</button>
+  </div>
 </header>
 <main id="main">
   <section id="login" class="card narrow" hidden>
     <h1>Sign in</h1>
+    <p class="muted">ClawdJumpServer console</p>
     <form id="login-form">
       <label>User <input name="name" autocomplete="username" required></label>
       <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
@@ -27,6 +33,6 @@
   </section>
   <section id="view"></section>
 </main>
-<div id="toast" role="status"></div>
+<div id="toasts" role="status" aria-live="polite"></div>
 </body>
 </html>
