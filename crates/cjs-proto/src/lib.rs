@@ -590,15 +590,20 @@ pub struct Capability {
     /// Audit session id.
     pub session: String,
     /// JSON list of network rules (`cjs_authz::net::NetRule`) the device
-    /// must apply to resolved addresses for egress (post-DNS SSRF check).
+    /// must apply to resolved addresses for egress and local forwards
+    /// (post-DNS checks).
     pub net_rules: Option<String>,
+    /// Hash of the exact request the server authorized (as sent to the
+    /// device): the device refuses to execute anything else, so a relay
+    /// cannot change the command, paths or environment under a valid token.
+    pub req_hash: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedCapability {
     /// postcard-encoded [`Capability`].
     pub body: Vec<u8>,
-    /// Ed25519 signature over `b"cjs-cap-v1" || body`.
+    /// Ed25519 signature over `b"cjs-cap-v2" || body`.
     pub sig: Vec<u8>,
 }
 

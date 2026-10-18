@@ -300,6 +300,7 @@ async fn open_and_relay(
         connection: dconn.id.clone(),
         target: req.net_target(),
         session: session.clone(),
+        req_hash: capability::request_hash(&req.for_device()),
         net_rules: match req {
             OpenRequest::Egress { .. } | OpenRequest::ForwardL { .. } => Some(
                 serde_json::to_string(&dec.egress_rules)

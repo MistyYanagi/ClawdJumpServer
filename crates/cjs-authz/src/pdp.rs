@@ -142,7 +142,8 @@ pub fn decide(req: &AccessRequest, grants: &[Grant], full: &[FullAccess]) -> Dec
             }
         }
     }
-    if req.device.is_some() && roots.is_empty() && full_access.is_none() {
+    // Egress through a device exits to the network and never touches files.
+    if req.device.is_some() && req.action != Action::Egress && roots.is_empty() && full_access.is_none() {
         return Decision::deny(ErrorCode::Forbidden, "grant has no project roots");
     }
     Decision {
@@ -352,7 +353,7 @@ mod tests {
             approved_by: None,
             decided_at: None,
             expires_at: None,
-            created_at: 0,
+            created_at: 1_700_000_000 - 60,
         };
         let now = 1_700_000_000;
         assert!(

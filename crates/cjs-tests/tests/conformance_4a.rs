@@ -535,6 +535,7 @@ async fn c08_device_verifies_capabilities_independently() {
         timeout_secs: None,
     };
     let now = cjs_server::db::now();
+    let req_hash = capability::request_hash(&req);
     let base = |stream: u32| Capability {
         version: CAP_VERSION,
         id: capability::new_id(),
@@ -550,6 +551,7 @@ async fn c08_device_verifies_capabilities_independently() {
         target: None,
         session: "s_test".into(),
         net_rules: None,
+        req_hash,
     };
     let forged_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     // (description, key, mutate) -> must be refused.
@@ -568,6 +570,7 @@ async fn c08_device_verifies_capabilities_independently() {
         }),
         ("overlong ttl", &sh.cap_key, |c, _| c.expires_at += 3600),
         ("no roots", &sh.cap_key, |c, _| c.roots.clear()),
+        ("other request", &sh.cap_key, |c, _| c.req_hash = [0; 32]),
     ];
     for (what, key, mutate) in cases {
         let mut s = dconn.mux.open().await.unwrap();
@@ -627,6 +630,7 @@ async fn c08_device_verifies_capabilities_independently() {
         host: "127.0.0.1".into(),
         port: 22,
     };
+    cap.req_hash = capability::request_hash(&fwd);
     write_msg(
         &mut s3,
         &DeviceOpen {

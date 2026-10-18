@@ -6,8 +6,8 @@ use std::sync::Mutex;
 use cjs_proto::{decode, encode, Action, Capability, ErrorCode, OpenRequest, ProtoError, SignedCapability};
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 
-const DOMAIN: &[u8] = b"cjs-cap-v1";
-pub const CAP_VERSION: u8 = 1;
+const DOMAIN: &[u8] = b"cjs-cap-v2";
+pub const CAP_VERSION: u8 = 2;
 /// Lifetime of a capability token: it only has to survive the open.
 pub const CAP_TTL_SECS: i64 = 60;
 const SKEW: i64 = 60;
@@ -20,6 +20,15 @@ pub fn sign(key: &SigningKey, cap: &Capability) -> SignedCapability {
         body,
         sig: key.sign(&msg).to_bytes().to_vec(),
     }
+}
+
+/// Hash binding a capability to one request (postcard encoding of the
+/// request exactly as the device receives it).
+pub fn request_hash(req: &OpenRequest) -> [u8; 32] {
+    *blake3::Hasher::new_derive_key("ClawdJumpServer capability request v2")
+        .update(&encode(req))
+        .finalize()
+        .as_bytes()
 }
 
 pub fn new_id() -> [u8; 16] {
@@ -98,7 +107,10 @@ impl CapVerifier {
         if req.net_target() != cap.target {
             return Err(deny("capability does not cover this network target"));
         }
-        if !cap.full_access && cap.roots.is_empty() {
+        if request_hash(req) != cap.req_hash {
+            return Err(deny("capability was issued for a different request"));
+        }
+        if !cap.full_access && cap.action != Action::Egress && cap.roots.is_empty() {
             return Err(deny("capability has no project roots"));
         }
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
@@ -139,6 +151,7 @@ mod tests {
             target: None,
             session: "s1".into(),
             net_rules: None,
+            req_hash: request_hash(&req),
         };
         (key, v, cap, req)
     }
@@ -211,8 +224,23 @@ mod tests {
             host: "127.0.0.1".into(),
             port: 22,
         };
+        cap.req_hash = request_hash(&ok);
         assert!(v.verify(&sign(&k, &cap), &bad, "c1", 1, 1010).is_err());
         cap.id = new_id();
         assert!(v.verify(&sign(&k, &cap), &ok, "c1", 1, 1010).is_ok());
+    }
+
+    #[test]
+    fn request_bound() {
+        let (k, v, cap, _) = setup();
+        let other = OpenRequest::Exec {
+            device: String::new(),
+            argv: vec!["rm".into(), "-rf".into(), ".".into()],
+            cwd: None,
+            env: vec![],
+            timeout_secs: None,
+        };
+        let e = v.verify(&sign(&k, &cap), &other, "c1", 1, 1010).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Forbidden);
     }
 }
