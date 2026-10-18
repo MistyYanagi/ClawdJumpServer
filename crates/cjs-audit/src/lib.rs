@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -477,23 +477,59 @@ pub fn verify_file(path: &Path, trusted: &VerifyingKey) -> Result<VerifyReport, 
     verify_conn(&conn, trusted)
 }
 
-fn verify_conn(conn: &Connection, trusted: &VerifyingKey) -> Result<VerifyReport, AuditError> {
-    let mut checkpoints: std::collections::BTreeMap<u64, (String, String, String)> = Default::default();
-    {
-        let mut st = conn.prepare("SELECT seq, hash, pubkey, sig FROM checkpoints ORDER BY seq")?;
-        let rows = st.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)? as u64,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-            ))
-        })?;
-        for row in rows {
-            let (s, h, pk, sig) = row?;
-            checkpoints.insert(s, (h, pk, sig));
+/// Index columns stored next to the body. Queries filter on them, so
+/// verification checks that each one matches the hashed body.
+struct Columns {
+    ts: i64,
+    kind: String,
+    actor: String,
+    target: String,
+    outcome: String,
+    session: Option<String>,
+    highlight: i64,
+}
+
+impl Columns {
+    /// Name of the first column that disagrees with the record.
+    fn mismatch(&self, r: &Record) -> Option<&'static str> {
+        let e = &r.event;
+        if self.ts != r.ts {
+            Some("ts")
+        } else if self.kind != e.kind {
+            Some("kind")
+        } else if self.actor != e.actor {
+            Some("actor")
+        } else if self.target != e.target {
+            Some("target")
+        } else if self.outcome != e.outcome.as_str() {
+            Some("outcome")
+        } else if self.session != e.session {
+            Some("session")
+        } else if self.highlight != e.highlight as i64 {
+            Some("highlight")
+        } else {
+            None
         }
     }
+}
+
+/// One stored event as read back for verification.
+struct StoredEvent {
+    /// Position (database `seq` column, or line order of an export).
+    seq: u64,
+    body: String,
+    hash: String,
+    columns: Option<Columns>,
+}
+
+/// (hash, pubkey hex, signature hex) of a checkpoint, by sequence number.
+type Checkpoints = std::collections::BTreeMap<u64, (String, String, String)>;
+
+fn verify_events(
+    checkpoints: &Checkpoints,
+    trusted: &VerifyingKey,
+    events: &mut dyn Iterator<Item = Result<StoredEvent, AuditError>>,
+) -> Result<VerifyReport, AuditError> {
     let mut report = VerifyReport {
         ok: true,
         events: 0,
@@ -509,11 +545,11 @@ fn verify_conn(conn: &Connection, trusted: &VerifyingKey) -> Result<VerifyReport
         r.ok = false;
     };
     // Every checkpoint signature must verify with the trusted key.
-    for (seq, (h, pk, sig)) in &checkpoints {
+    for (seq, (h, pk, sig)) in checkpoints {
         let sig_ok = hex::decode(sig)
             .ok()
             .and_then(|b| ed25519_dalek::Signature::from_slice(&b).ok())
-            .map(|s| trusted.verify(&checkpoint_msg(*seq, h), &s).is_ok())
+            .map(|s| trusted.verify_strict(&checkpoint_msg(*seq, h), &s).is_ok())
             .unwrap_or(false);
         if !sig_ok {
             fail(&mut report, format!("checkpoint {seq}: bad signature"));
@@ -522,20 +558,28 @@ fn verify_conn(conn: &Connection, trusted: &VerifyingKey) -> Result<VerifyReport
             fail(&mut report, format!("checkpoint {seq}: signed by untrusted key"));
         }
     }
-    let mut st = conn.prepare("SELECT seq, body, hash FROM events ORDER BY seq")?;
-    let mut rows = st.query([])?;
     let mut prev = [0u8; 32];
     let mut expect = 1u64;
     let mut last_cp = 0u64;
-    while let Some(r) = rows.next()? {
-        let seq = r.get::<_, i64>(0)? as u64;
-        let body: String = r.get(1)?;
-        let hash: String = r.get(2)?;
+    for ev in events {
+        let StoredEvent {
+            seq,
+            body,
+            hash,
+            columns,
+        } = ev?;
         if seq != expect {
             fail(&mut report, format!("event {expect}: missing (found {seq})"));
         }
         match serde_json::from_str::<Record>(&body) {
-            Ok(rec) if rec.seq == seq => {}
+            Ok(rec) if rec.seq == seq => {
+                if let Some(col) = columns.as_ref().and_then(|c| c.mismatch(&rec)) {
+                    fail(
+                        &mut report,
+                        format!("event {seq}: indexed column {col} does not match the body"),
+                    );
+                }
+            }
             _ => fail(
                 &mut report,
                 format!("event {seq}: body does not match its sequence number"),
@@ -573,6 +617,129 @@ fn verify_conn(conn: &Connection, trusted: &VerifyingKey) -> Result<VerifyReport
     report.head = hex::encode(prev);
     report.unsigned_tail = report.events - last_cp.min(report.events);
     Ok(report)
+}
+
+fn verify_conn(conn: &Connection, trusted: &VerifyingKey) -> Result<VerifyReport, AuditError> {
+    let mut checkpoints = Checkpoints::new();
+    {
+        let mut st = conn.prepare("SELECT seq, hash, pubkey, sig FROM checkpoints ORDER BY seq")?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u64,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (s, h, pk, sig) = row?;
+            checkpoints.insert(s, (h, pk, sig));
+        }
+    }
+    let mut st = conn.prepare(
+        "SELECT seq, body, hash, ts, kind, actor, target, outcome, session, highlight
+         FROM events ORDER BY seq",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok(StoredEvent {
+            seq: r.get::<_, i64>(0)? as u64,
+            body: r.get(1)?,
+            hash: r.get(2)?,
+            columns: Some(Columns {
+                ts: r.get(3)?,
+                kind: r.get(4)?,
+                actor: r.get(5)?,
+                target: r.get(6)?,
+                outcome: r.get(7)?,
+                session: r.get(8)?,
+                highlight: r.get(9)?,
+            }),
+        })
+    })?;
+    let mut it = rows.map(|r| r.map_err(AuditError::from));
+    verify_events(&checkpoints, trusted, &mut it)
+}
+
+/// Verify an export produced by [`AuditLog::export_jsonl`] offline, against
+/// an explicitly supplied (out-of-band pinned) public key. Nothing in the
+/// file itself is trusted: the `pubkey` recorded in each checkpoint must
+/// equal `trusted`, every signature must verify with it, and the chain is
+/// recomputed from the bodies.
+pub fn verify_export(r: &mut dyn std::io::BufRead, trusted: &VerifyingKey) -> Result<VerifyReport, AuditError> {
+    #[derive(Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum Line {
+        Event {
+            hash: String,
+            body: String,
+        },
+        Checkpoint {
+            seq: u64,
+            hash: String,
+            pubkey: String,
+            sig: String,
+        },
+    }
+    let mut events = Vec::new();
+    let mut checkpoints = Checkpoints::new();
+    let mut line = String::new();
+    let mut n = 0u64;
+    loop {
+        line.clear();
+        if r.read_line(&mut line).map_err(|e| AuditError::Storage(e.to_string()))? == 0 {
+            break;
+        }
+        n += 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Line>(&line)
+            .map_err(|e| AuditError::Storage(format!("line {n}: {e}")))?
+        {
+            Line::Event { hash, body } => {
+                if !checkpoints.is_empty() {
+                    return Err(AuditError::Storage(format!("line {n}: event after checkpoints")));
+                }
+                events.push((hash, body));
+            }
+            Line::Checkpoint {
+                seq,
+                hash,
+                pubkey,
+                sig,
+            } => {
+                if checkpoints.insert(seq, (hash, pubkey, sig)).is_some() {
+                    return Err(AuditError::Storage(format!("line {n}: duplicate checkpoint {seq}")));
+                }
+            }
+        }
+    }
+    // Position in the file is the sequence number the body must carry.
+    let mut it = events.into_iter().enumerate().map(|(i, (hash, body))| {
+        Ok(StoredEvent {
+            seq: i as u64 + 1,
+            body,
+            hash,
+            columns: None,
+        })
+    });
+    verify_events(&checkpoints, trusted, &mut it)
+}
+
+/// Parse a hex-encoded Ed25519 public key (as printed by the server).
+pub fn parse_public_key(hex_key: &str) -> Result<VerifyingKey, AuditError> {
+    let b = hex::decode(hex_key.trim()).map_err(|_| AuditError::Storage("public key is not hex".into()))?;
+    let b: [u8; 32] = b
+        .try_into()
+        .map_err(|_| AuditError::Storage("public key must be 32 bytes".into()))?;
+    VerifyingKey::from_bytes(&b).map_err(|e| AuditError::Storage(format!("bad public key: {e}")))
+}
+
+/// Short fingerprint of an audit public key for out-of-band pinning:
+/// the first 16 bytes of SHA-256 over the key, in hex.
+pub fn key_fingerprint(key: &VerifyingKey) -> String {
+    use sha2::Digest;
+    hex::encode(&sha2::Sha256::digest(key.as_bytes())[..16])
 }
 
 pub fn generate_key() -> SigningKey {
@@ -669,6 +836,115 @@ mod tests {
         l.with_conn(|c| c.execute("DELETE FROM events WHERE seq > 90", []).unwrap());
         let r = l.verify(None).unwrap();
         assert!(!r.ok, "{r:?}");
+    }
+
+    #[test]
+    fn index_column_tampering_detected() {
+        // Queries filter on the index columns; rewriting one (to hide an
+        // event from a filtered query) must fail verification even though
+        // body and hash are untouched.
+        for (col, val) in [
+            ("kind", "'other.kind'"),
+            ("actor", "'u2'"),
+            ("target", "'d2'"),
+            ("outcome", "'denied'"),
+            ("session", "'s9'"),
+            ("highlight", "1"),
+            ("ts", "ts + 1"),
+        ] {
+            let l = log();
+            fill(&l, 10);
+            l.with_conn(|c| {
+                c.execute(&format!("UPDATE events SET {col} = {val} WHERE seq = 4"), [])
+                    .unwrap()
+            });
+            let r = l.verify(None).unwrap();
+            assert!(!r.ok, "{col}: {r:?}");
+            let e = r.error.unwrap();
+            assert!(e.contains("event 4") && e.contains(col), "{col}: {e}");
+        }
+    }
+
+    fn export(l: &AuditLog) -> String {
+        let mut out = Vec::new();
+        l.export_jsonl(&mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn export_verifies_offline_with_pinned_key() {
+        let l = log();
+        fill(&l, 150);
+        l.checkpoint().unwrap();
+        let text = export(&l);
+        let pk = parse_public_key(&hex::encode(l.verifying_key().as_bytes())).unwrap();
+        let r = verify_export(&mut text.as_bytes(), &pk).unwrap();
+        assert!(r.ok, "{r:?}");
+        assert_eq!((r.events, r.checkpoints, r.unsigned_tail), (150, 2, 0));
+        assert_eq!(r.head, l.verify(None).unwrap().head);
+        // A different (attacker's) key is not accepted, even though the
+        // file names its own signer.
+        let other = generate_key().verifying_key();
+        assert!(!verify_export(&mut text.as_bytes(), &other).unwrap().ok);
+    }
+
+    #[test]
+    fn export_tampering_detected() {
+        let l = log();
+        fill(&l, 120);
+        l.checkpoint().unwrap();
+        let text = export(&l);
+        let pk = l.verifying_key();
+        // Altered body.
+        let t = text.replacen("\\\"i\\\":7", "\\\"i\\\":8", 1);
+        assert_ne!(t, text);
+        assert!(!verify_export(&mut t.as_bytes(), &pk).unwrap().ok);
+        // Dropped event line.
+        let t: Vec<&str> = text.lines().collect();
+        let t = [&t[..5], &t[6..]].concat().join("\n");
+        assert!(!verify_export(&mut t.as_bytes(), &pk).unwrap().ok);
+        // Truncated tail (checkpoints kept).
+        let (ev, cp): (Vec<&str>, Vec<&str>) = text.lines().partition(|l| l.contains("\"type\":\"event\""));
+        let t = [&ev[..90], &cp[..]].concat().join("\n");
+        assert!(!verify_export(&mut t.as_bytes(), &pk).unwrap().ok);
+    }
+
+    #[test]
+    fn tampered_checkpoint_signature_detected() {
+        let l = log();
+        fill(&l, 100);
+        let text = export(&l);
+        let pk = l.verifying_key();
+        let cp = text.lines().find(|l| l.contains("\"type\":\"checkpoint\"")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(cp).unwrap();
+        let sig = v["sig"].as_str().unwrap();
+        // Flip one bit of the signature.
+        let mut b = hex::decode(sig).unwrap();
+        b[10] ^= 1;
+        let t = text.replace(sig, &hex::encode(b));
+        let r = verify_export(&mut t.as_bytes(), &pk).unwrap();
+        assert!(!r.ok);
+        assert!(r.error.unwrap().contains("bad signature"));
+        // Same in the database.
+        l.with_conn(|c| {
+            c.execute(
+                "UPDATE checkpoints SET sig = ?1",
+                params![hex::encode([7u8; 64])],
+            )
+            .unwrap()
+        });
+        assert!(!l.verify(None).unwrap().ok);
+        // A checkpoint re-signed by another key is rejected as well.
+        let other = generate_key();
+        let head = l.verify(None).unwrap().head;
+        let forged = format!(
+            "{{\"type\":\"checkpoint\",\"seq\":100,\"hash\":\"{head}\",\"pubkey\":\"{}\",\"sig\":\"{}\"}}",
+            hex::encode(other.verifying_key().as_bytes()),
+            hex::encode(other.sign(&checkpoint_msg(100, &head)).to_bytes())
+        );
+        let ev: Vec<&str> = text.lines().filter(|l| l.contains("\"type\":\"event\"")).collect();
+        let t = format!("{}\n{forged}\n", ev.join("\n"));
+        assert!(!verify_export(&mut t.as_bytes(), &pk).unwrap().ok);
     }
 
     #[test]

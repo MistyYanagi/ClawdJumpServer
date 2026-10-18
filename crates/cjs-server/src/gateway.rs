@@ -212,6 +212,14 @@ impl Server {
     pub fn start(cfg: ServerConfig, keys: Keys, db: Db, audit: cjs_audit::AuditLog) -> Self {
         let lease = cfg.lease_interval;
         let trust = cfg.trust_forwarded_for;
+        // Operators pin these out of band: the audit key verifies exported
+        // logs offline (`cjsctl audit verify --file ... --pubkey ...`).
+        tracing::info!(
+            audit_key = %hex::encode(keys.audit.verifying_key().as_bytes()),
+            audit_fingerprint = %keys.audit_fingerprint(),
+            server_key = %hex::encode(keys.noise.public),
+            "server keys (pin the audit key out of band)"
+        );
         let shared = Arc::new(Shared::new(db, audit, keys.cap, keys.noise.public, cfg));
         let (transport, accepted) = TransportServer::new(TransportServerConfig {
             key: keys.noise,

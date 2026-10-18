@@ -132,7 +132,7 @@ fn main() {
                 println!("{token}");
             }
             Cmd::AuditVerify => {
-                let keys = Keys::load_or_create(&cli.data).unwrap_or_else(|e| die(e));
+                let keys = Keys::load_existing(&cli.data).unwrap_or_else(|e| die(e));
                 let r = cjs_audit::verify_file(&cli.data.join("audit.db"), &keys.audit.verifying_key())
                     .unwrap_or_else(|e| die(e));
                 println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
@@ -141,7 +141,7 @@ fn main() {
                 }
             }
             Cmd::Info => {
-                let keys = Keys::load_or_create(&cli.data).unwrap_or_else(|e| die(e));
+                let keys = Keys::load_existing(&cli.data).unwrap_or_else(|e| die(e));
                 println!("server key:     {}", hex::encode(keys.noise.public));
                 println!("fingerprint:    {}", keys.noise.fingerprint());
                 println!(

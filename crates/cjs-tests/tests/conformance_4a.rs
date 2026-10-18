@@ -778,6 +778,32 @@ async fn c11_audit_chain_tamper_evidence_and_recordings() {
         .unwrap();
     let text = r.text().await.unwrap();
     assert!(text.lines().any(|l| l.contains("\"type\":\"checkpoint\"")));
+    // Offline verification of the exported file against a key pinned out
+    // of band (derived here from the key file, not taken from the export
+    // or the API), and the API publishes the same key.
+    let key_hex = std::fs::read_to_string(env.tmp.path().join("server/audit.key")).unwrap();
+    let key_bytes: [u8; 32] = hex::decode(key_hex.trim()).unwrap().try_into().unwrap();
+    let pinned = ed25519_dalek::SigningKey::from_bytes(&key_bytes).verifying_key();
+    let (st, info) = aud.call("GET", "/info", None).await;
+    assert_eq!(st, 200);
+    assert_eq!(info["audit_key"], hex::encode(pinned.as_bytes()));
+    let offline = cjs_audit::verify_export(&mut text.as_bytes(), &pinned).unwrap();
+    assert!(offline.ok && offline.checkpoints >= 1, "{offline:?}");
+    assert_eq!(offline.head, log.verify(None).unwrap().head);
+    // A forged export (tampered checkpoint signature) fails offline.
+    let cp = text.lines().find(|l| l.contains("\"type\":\"checkpoint\"")).unwrap();
+    let sig = serde_json::from_str::<serde_json::Value>(cp).unwrap()["sig"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut bad = hex::decode(&sig).unwrap();
+    bad[0] ^= 0x80;
+    let forged = text.replace(&sig, &hex::encode(bad));
+    let r = cjs_audit::verify_export(&mut forged.as_bytes(), &pinned).unwrap();
+    assert!(!r.ok, "tampered checkpoint signature must be detected");
+    // ... and so does a correct export checked against another key.
+    let other = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+    assert!(!cjs_audit::verify_export(&mut text.as_bytes(), &other).unwrap().ok);
     // Rewriting an event breaks the chain.
     log.with_conn(|c| {
         c.execute(

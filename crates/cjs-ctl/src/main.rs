@@ -213,7 +213,16 @@ enum AuditCmd {
         #[arg(long, default_value_t = 100)]
         limit: u32,
     },
-    Verify,
+    /// Verify on the server, or with `--file` offline against `--pubkey`.
+    Verify {
+        /// Exported JSON Lines file (`cjsctl audit export`) to verify
+        /// offline, without contacting the server.
+        #[arg(long, requires = "pubkey")]
+        file: Option<PathBuf>,
+        /// Pinned audit public key: 64 hex chars, or a file containing them.
+        #[arg(long)]
+        pubkey: Option<String>,
+    },
     Export {
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -227,6 +236,21 @@ struct Session {
     cookie: String,
     csrf: String,
     ca: Option<PathBuf>,
+}
+
+/// `cjsctl audit verify --file export.jsonl --pubkey <hex|file>`: verify an
+/// export offline against a pinned key. Exits 0 when valid, 2 otherwise.
+fn audit_verify_offline(file: &std::path::Path, pubkey: &str) -> ! {
+    let hex_key = if pubkey.len() == 64 && pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+        pubkey.to_string()
+    } else {
+        std::fs::read_to_string(pubkey).unwrap_or_else(|e| die(format!("{pubkey}: {e}")))
+    };
+    let key = cjs_audit::parse_public_key(&hex_key).unwrap_or_else(|e| die(e));
+    let f = std::fs::File::open(file).unwrap_or_else(|e| die(format!("{}: {e}", file.display())));
+    let r = cjs_audit::verify_export(&mut std::io::BufReader::new(f), &key).unwrap_or_else(|e| die(e));
+    println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+    std::process::exit(if r.ok { 0 } else { 2 })
 }
 
 fn die(m: impl std::fmt::Display) -> ! {
@@ -367,6 +391,13 @@ fn enc(s: &str) -> String {
 async fn main() {
     let cli = Cli::parse();
     let path = session_path(&cli);
+    if let Cmd::Audit(AuditCmd::Verify {
+        file: Some(file),
+        pubkey: Some(pubkey),
+    }) = &cli.cmd
+    {
+        audit_verify_offline(file, pubkey);
+    }
     match &cli.cmd {
         Cmd::Login { server, name, ca } => {
             let password = prompt("password: ", "CJS_PASSWORD", true);
@@ -581,7 +612,7 @@ async fn run(api: &Api, cmd: &Cmd) {
                 }
                 api.get(&format!("/audit?{}", q.join("&"))).await
             }
-            AuditCmd::Verify => api.get("/audit/verify").await,
+            AuditCmd::Verify { .. } => api.get("/audit/verify").await,
             AuditCmd::Export { output } => {
                 let bytes = api
                     .raw(M::GET, "/audit/export", None)
