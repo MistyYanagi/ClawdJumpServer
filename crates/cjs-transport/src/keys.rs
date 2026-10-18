@@ -79,6 +79,13 @@ pub fn write_secret_file(path: &Path, data: &[u8]) -> Result<(), ProtoError> {
         opts.mode(0o600);
     }
     let mut f = opts.open(path).map_err(io)?;
+    // `mode` only applies when the file is created; tighten existing ones.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(io)?;
+    }
     f.write_all(data).map_err(io)
 }
 
