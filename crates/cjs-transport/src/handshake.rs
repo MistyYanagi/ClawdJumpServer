@@ -2,7 +2,8 @@
 use cjs_proto::{
     decode, encode, ErrorCode, HandshakeReply, Hello, ProtoError, Welcome, NOISE_MAX_MSG, NOISE_PARAMS,
 };
-use sha2_lite::resume_secret;
+
+use crate::mac::CtlKeys;
 
 fn perr(e: snow::Error) -> ProtoError {
     ProtoError::new(ErrorCode::Unauthenticated, format!("noise: {e}"))
@@ -13,7 +14,7 @@ pub(crate) struct ClientHs {
 }
 
 /// Prologue binds the protocol name so cross-protocol replays fail.
-const PROLOGUE: &[u8] = b"clawdjumpserver/v1";
+const PROLOGUE: &[u8] = b"clawdjumpserver/v2";
 
 impl ClientHs {
     pub(crate) fn start(
@@ -39,7 +40,7 @@ impl ClientHs {
     pub(crate) fn finish(
         mut self,
         msg2: &[u8],
-    ) -> Result<(snow::StatelessTransportState, Welcome, String), ProtoError> {
+    ) -> Result<(snow::StatelessTransportState, Welcome, CtlKeys), ProtoError> {
         let mut buf = vec![0u8; NOISE_MAX_MSG];
         let n = self.hs.read_message(msg2, &mut buf).map_err(|_| {
             ProtoError::new(
@@ -52,16 +53,16 @@ impl ClientHs {
             HandshakeReply::Welcome(w) => w,
             HandshakeReply::Rejected(e) => return Err(e),
         };
-        let secret = resume_secret(self.hs.get_handshake_hash());
+        let keys = CtlKeys::derive(self.hs.get_handshake_hash(), true);
         let ts = self.hs.into_stateless_transport_mode().map_err(perr)?;
-        Ok((ts, welcome, secret))
+        Ok((ts, welcome, keys))
     }
 }
 
 pub(crate) struct ServerHsOutcome {
     pub msg2: Vec<u8>,
     /// `None` when the client was rejected (msg2 then carries the reason).
-    pub session: Option<(snow::StatelessTransportState, Welcome, Hello, [u8; 32], String)>,
+    pub session: Option<(snow::StatelessTransportState, Welcome, Hello, [u8; 32], CtlKeys)>,
     pub rejection: Option<ProtoError>,
 }
 
@@ -95,11 +96,11 @@ pub(crate) fn respond(
     out.truncate(n);
     match decision {
         Ok(w) => {
-            let secret = resume_secret(hs.get_handshake_hash());
+            let keys = CtlKeys::derive(hs.get_handshake_hash(), false);
             let ts = hs.into_stateless_transport_mode().map_err(perr)?;
             Ok(ServerHsOutcome {
                 msg2: out,
-                session: Some((ts, w, hello, client_key, secret)),
+                session: Some((ts, w, hello, client_key, keys)),
                 rejection: None,
             })
         }
@@ -108,17 +109,5 @@ pub(crate) fn respond(
             session: None,
             rejection: Some(e),
         }),
-    }
-}
-
-mod sha2_lite {
-    /// Resume secret = hex(BLAKE2s-derived handshake hash, domain separated).
-    /// The handshake hash is only known to the two Noise parties.
-    pub(crate) fn resume_secret(h: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
-        let mut d = Sha256::new();
-        d.update(b"cjs-resume-v1");
-        d.update(h);
-        hex::encode(d.finalize())
     }
 }

@@ -665,7 +665,10 @@ fn verify_conn(conn: &Connection, trusted: &VerifyingKey) -> Result<VerifyReport
 /// file itself is trusted: the `pubkey` recorded in each checkpoint must
 /// equal `trusted`, every signature must verify with it, and the chain is
 /// recomputed from the bodies.
-pub fn verify_export(r: &mut dyn std::io::BufRead, trusted: &VerifyingKey) -> Result<VerifyReport, AuditError> {
+pub fn verify_export(
+    r: &mut dyn std::io::BufRead,
+    trusted: &VerifyingKey,
+) -> Result<VerifyReport, AuditError> {
     #[derive(Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     enum Line {
@@ -686,7 +689,10 @@ pub fn verify_export(r: &mut dyn std::io::BufRead, trusted: &VerifyingKey) -> Re
     let mut n = 0u64;
     loop {
         line.clear();
-        if r.read_line(&mut line).map_err(|e| AuditError::Storage(e.to_string()))? == 0 {
+        if r.read_line(&mut line)
+            .map_err(|e| AuditError::Storage(e.to_string()))?
+            == 0
+        {
             break;
         }
         n += 1;
@@ -709,7 +715,9 @@ pub fn verify_export(r: &mut dyn std::io::BufRead, trusted: &VerifyingKey) -> Re
                 sig,
             } => {
                 if checkpoints.insert(seq, (hash, pubkey, sig)).is_some() {
-                    return Err(AuditError::Storage(format!("line {n}: duplicate checkpoint {seq}")));
+                    return Err(AuditError::Storage(format!(
+                        "line {n}: duplicate checkpoint {seq}"
+                    )));
                 }
             }
         }
@@ -915,7 +923,10 @@ mod tests {
         fill(&l, 100);
         let text = export(&l);
         let pk = l.verifying_key();
-        let cp = text.lines().find(|l| l.contains("\"type\":\"checkpoint\"")).unwrap();
+        let cp = text
+            .lines()
+            .find(|l| l.contains("\"type\":\"checkpoint\""))
+            .unwrap();
         let v: serde_json::Value = serde_json::from_str(cp).unwrap();
         let sig = v["sig"].as_str().unwrap();
         // Flip one bit of the signature.
@@ -927,11 +938,8 @@ mod tests {
         assert!(r.error.unwrap().contains("bad signature"));
         // Same in the database.
         l.with_conn(|c| {
-            c.execute(
-                "UPDATE checkpoints SET sig = ?1",
-                params![hex::encode([7u8; 64])],
-            )
-            .unwrap()
+            c.execute("UPDATE checkpoints SET sig = ?1", params![hex::encode([7u8; 64])])
+                .unwrap()
         });
         assert!(!l.verify(None).unwrap().ok);
         // A checkpoint re-signed by another key is rejected as well.
@@ -942,7 +950,10 @@ mod tests {
             hex::encode(other.verifying_key().as_bytes()),
             hex::encode(other.sign(&checkpoint_msg(100, &head)).to_bytes())
         );
-        let ev: Vec<&str> = text.lines().filter(|l| l.contains("\"type\":\"event\"")).collect();
+        let ev: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("\"type\":\"event\""))
+            .collect();
         let t = format!("{}\n{forged}\n", ev.join("\n"));
         assert!(!verify_export(&mut t.as_bytes(), &pk).unwrap().ok);
     }

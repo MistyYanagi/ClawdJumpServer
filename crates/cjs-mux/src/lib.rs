@@ -330,9 +330,9 @@ mod tests {
     fn limits_are_bounded() {
         // Constructing the config runs yamux's own consistency assertions.
         let _ = config();
-        assert!(MAX_STREAMS <= 128);
-        assert!(MAX_CONNECTION_RECEIVE_WINDOW <= 64 * 1024 * 1024);
-        assert!(MAX_CONNECTION_RECEIVE_WINDOW >= MAX_STREAMS * yamux::DEFAULT_CREDIT as usize);
+        const { assert!(MAX_STREAMS <= 128) };
+        const { assert!(MAX_CONNECTION_RECEIVE_WINDOW <= 64 * 1024 * 1024) };
+        const { assert!(MAX_CONNECTION_RECEIVE_WINDOW >= MAX_STREAMS * yamux::DEFAULT_CREDIT as usize) };
     }
 
     #[tokio::test]

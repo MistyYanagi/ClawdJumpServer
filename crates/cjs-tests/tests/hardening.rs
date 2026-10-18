@@ -64,6 +64,55 @@ async fn max_sessions_holds_under_concurrent_opens() {
     assert!(admitted, "slot never released");
 }
 
+/// T2: unauthenticated handshake garbage neither writes one durable audit
+/// row per request nor gets unlimited crypto work: it is rate limited and
+/// the rejections are aggregated into one summary per window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unauthenticated_handshake_flood_is_aggregated() {
+    let env = Env::start(mode_from_env()).await;
+    let before = env.audit_kinds().len();
+    let http = reqwest::Client::new();
+    let mut limited = 0;
+    for _ in 0..200 {
+        let r = http
+            .post(format!("{}v1/t/open", env.url))
+            .body(vec![0u8; 10])
+            .send()
+            .await
+            .unwrap();
+        match r.status().as_u16() {
+            401 => {}
+            429 => limited += 1,
+            s => panic!("unexpected status {s}"),
+        }
+    }
+    assert!(limited >= 150, "rate limit not applied ({limited} limited)");
+    let rows = env.audit_kinds();
+    let added = &rows[before..];
+    assert!(added.len() <= 2, "flood wrote {} audit rows", added.len());
+    assert!(added.iter().any(|(k, _)| k == "gateway.reject"));
+    env.server.shared.flush_rejects(60).unwrap();
+    let summary = env
+        .server
+        .shared
+        .audit
+        .query(&cjs_audit::Query {
+            kind: Some("gateway.reject_summary".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(summary.len(), 1);
+    let suppressed = summary[0].record.event.data["suppressed"].as_u64().unwrap();
+    assert!(suppressed >= 199 - added.len() as u64, "{suppressed}");
+    // A legitimate client from the same address still connects once the
+    // bucket refills.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let a = env.agent().await;
+    assert!(!a.handle.is_closed());
+    // The chain stays verifiable.
+    assert!(env.server.shared.audit.verify(None).unwrap().ok);
+}
+
 /// T4: a terminal session that exceeds the recording size limit is
 /// terminated and the reason is audited; the recording stays bounded and
 /// its audited hash matches the file.
@@ -76,7 +125,10 @@ async fn recording_size_limit_terminates_session() {
     let (mut s, session) = a.open(pty_req("dev1")).await.unwrap();
     write_msg(
         &mut s,
-        &cjs_proto::PtyIn::Input(b"i=0; while [ $i -lt 20000 ]; do echo 0123456789abcdef0123456789abcdef; i=$((i+1)); done\n".to_vec()),
+        &cjs_proto::PtyIn::Input(
+            b"i=0; while [ $i -lt 20000 ]; do echo 0123456789abcdef0123456789abcdef; i=$((i+1)); done\n"
+                .to_vec(),
+        ),
     )
     .await
     .unwrap();
@@ -88,9 +140,17 @@ async fn recording_size_limit_terminates_session() {
     let rec = &d["recording"];
     let size = rec["size"].as_u64().unwrap();
     assert!(size <= limit, "{size}");
-    let file = env.server.shared.cfg.recordings_dir.join(rec["file"].as_str().unwrap());
+    let file = env
+        .server
+        .shared
+        .cfg
+        .recordings_dir
+        .join(rec["file"].as_str().unwrap());
     let data = std::fs::read(file).unwrap();
     use sha2::Digest;
     assert_eq!(data.len() as u64, size);
-    assert_eq!(hex::encode(sha2::Sha256::digest(&data)), rec["sha256"].as_str().unwrap());
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(&data)),
+        rec["sha256"].as_str().unwrap()
+    );
 }

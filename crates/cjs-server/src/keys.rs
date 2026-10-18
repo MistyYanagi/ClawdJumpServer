@@ -26,7 +26,8 @@ pub const CAP_KEY_FILE: &str = "capability.key";
 pub const AUDIT_KEY_FILE: &str = "audit.key";
 
 fn ed_load(path: &Path) -> Result<SigningKey, ApiError> {
-    let s = std::fs::read_to_string(path).map_err(|e| ApiError::internal(format!("{}: {e}", path.display())))?;
+    let s =
+        std::fs::read_to_string(path).map_err(|e| ApiError::internal(format!("{}: {e}", path.display())))?;
     let b = hex::decode(s.trim()).map_err(|_| ApiError::internal(format!("{}: bad key", path.display())))?;
     let b: [u8; 32] = b
         .try_into()

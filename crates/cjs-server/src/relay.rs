@@ -220,14 +220,12 @@ async fn open_and_relay(
     // Decision and concurrency slot are taken atomically; the slot is
     // released when this function returns (the registered stream then
     // counts until it ends).
-    let (dec, device, _slot) = sh
-        .decide_and_reserve(p, &req, stream_id)
-        .map_err(|e| e.proto())?;
+    let (dec, device, _slot) = sh.decide_and_reserve(p, &req, stream_id).map_err(|e| e.proto())?;
     let target = device
         .as_ref()
         .map(|d| d.id.clone())
         .unwrap_or_else(|| req.net_target().unwrap_or_else(|| "server".into()));
-    sh.audit(
+    sh.audit_async(
         Event::new(
             "authz.decision",
             &p.id,
@@ -252,6 +250,7 @@ async fn open_and_relay(
             "full_access": dec.full_access,
         })),
     )
+    .await
     .map_err(|e| e.proto())?;
     if !dec.allow {
         return Err(perr(dec.code.unwrap_or(ErrorCode::Forbidden), dec.reason));
@@ -324,12 +323,13 @@ async fn open_and_relay(
     let device_ref = match dreply {
         OpenReply::Ok { id, .. } => id,
         OpenReply::Err(e) => {
-            let _ = sh.audit(
+            let _ = sh.audit_async(
                 Event::new("session.fail", &p.id, &target, Outcome::Failure)
                     .session(session.clone())
                     .ip(conn.peer.clone())
                     .data(json!({"kind": req.kind().as_str(), "code": e.code.as_str(), "reason": e.message})),
-            );
+            )
+        .await;
             return Err(e);
         }
     };
@@ -361,7 +361,7 @@ async fn open_and_relay(
         conn.peer.clone(),
     ));
     let _g = sh.reg.add_stream(info.clone());
-    sh.audit(
+    sh.audit_async(
         Event::new("session.start", &p.id, &target, Outcome::Success)
             .session(session.clone())
             .ip(conn.peer.clone())
@@ -376,6 +376,7 @@ async fn open_and_relay(
                 "transport": conn.transport,
             })),
     )
+    .await
     .map_err(|e| e.proto())?;
     write_msg(
         s,
@@ -427,13 +428,16 @@ async fn open_and_relay(
         ),
     };
     stats["error"] = err;
-    if let Err(e) = sh.audit(
-        Event::new("session.end", &p.id, &target, outcome)
-            .session(session.clone())
-            .ip(conn.peer.clone())
-            .highlight(dec.full_access.is_some())
-            .data(stats),
-    ) {
+    if let Err(e) = sh
+        .audit_async(
+            Event::new("session.end", &p.id, &target, outcome)
+                .session(session.clone())
+                .ip(conn.peer.clone())
+                .highlight(dec.full_access.is_some())
+                .data(stats),
+        )
+        .await
+    {
         tracing::error!(%session, err = %e, "could not audit session end");
     }
     result
@@ -500,11 +504,14 @@ pub(crate) async fn device_stream(sh: Arc<Shared>, dconn: Arc<ConnInfo>, mut s: 
         Ok(a) => a,
         Err(e) => return reply_err(&mut s, e).await,
     };
-    if let Err(e) = sh.audit(
-        Event::new("forward.conn", &reg.principal, &reg.device, Outcome::Success)
-            .session(reg.session.clone())
-            .data(json!({"stream": id, "listener": reg.agent_listener, "peer": peer})),
-    ) {
+    if let Err(e) = sh
+        .audit_async(
+            Event::new("forward.conn", &reg.principal, &reg.device, Outcome::Success)
+                .session(reg.session.clone())
+                .data(json!({"stream": id, "listener": reg.agent_listener, "peer": peer})),
+        )
+        .await
+    {
         return reply_err(&mut s, e.proto()).await;
     }
     if write_msg(
@@ -521,25 +528,27 @@ pub(crate) async fn device_stream(sh: Arc<Shared>, dconn: Arc<ConnInfo>, mut s: 
     }
     let started = Instant::now();
     let (r, down, up) = relay_raw(&mut s, &mut a, &reg.cancel).await;
-    let _ = sh.audit(
-        Event::new(
-            "forward.conn_end",
-            &reg.principal,
-            &reg.device,
-            if r.is_ok() {
-                Outcome::Success
-            } else {
-                Outcome::Failure
-            },
+    let _ = sh
+        .audit_async(
+            Event::new(
+                "forward.conn_end",
+                &reg.principal,
+                &reg.device,
+                if r.is_ok() {
+                    Outcome::Success
+                } else {
+                    Outcome::Failure
+                },
+            )
+            .session(reg.session.clone())
+            .data(json!({
+                "stream": id,
+                "bytes_to_agent": down,
+                "bytes_to_device": up,
+                "duration_ms": started.elapsed().as_millis() as u64,
+            })),
         )
-        .session(reg.session.clone())
-        .data(json!({
-            "stream": id,
-            "bytes_to_agent": down,
-            "bytes_to_device": up,
-            "duration_ms": started.elapsed().as_millis() as u64,
-        })),
-    );
+        .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -809,7 +818,10 @@ async fn relay_file_get(
         |m| match m {
             FileMsg::Meta { size, mode, mtime } if allowed.is_none() => {
                 if offset > *size {
-                    return Err(perr(ErrorCode::Protocol, "device announced a size below the offset"));
+                    return Err(perr(
+                        ErrorCode::Protocol,
+                        "device announced a size below the offset",
+                    ));
                 }
                 meta = json!({"size": size, "mode": mode, "mtime": mtime});
                 allowed = Some(size - offset);

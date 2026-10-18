@@ -36,6 +36,8 @@ pub struct ServerConfig {
     /// Size limit of one terminal recording. A session that reaches it is
     /// terminated (recording is mandatory) and the reason is audited.
     pub max_recording_bytes: u64,
+    /// Per-source-address rate limit of transport handshakes.
+    pub handshake_limit: cjs_transport::HandshakeLimit,
 }
 
 impl ServerConfig {
@@ -48,6 +50,7 @@ impl ServerConfig {
             web_idle_secs: 30 * 60,
             web_max_secs: 12 * 3600,
             max_recording_bytes: cjs_audit::recording::DEFAULT_MAX_RECORDING,
+            handshake_limit: cjs_transport::HandshakeLimit::default(),
         }
     }
 }
@@ -385,7 +388,27 @@ pub struct Shared {
     admission: Mutex<()>,
     /// Failed web logins per client address: (count, window start).
     pub login_failures: Mutex<HashMap<String, (u32, i64)>>,
+    /// Unauthenticated gateway rejections suppressed in the current window.
+    rejects: Mutex<RejectAgg>,
 }
+
+/// Aggregation of `gateway.reject` events. Rejections need no credentials,
+/// so writing one durable, hash-chained row each would let anyone flood
+/// the audit log: per window, the first rejection from each address is
+/// written immediately, the rest are counted and summarized once in a
+/// `gateway.reject_summary` event when the window is flushed.
+#[derive(Default)]
+struct RejectAgg {
+    /// address -> rejections suppressed this window.
+    by_ip: HashMap<String, u64>,
+    /// Suppressed rejections from addresses beyond [`REJECT_TRACKED`].
+    overflow: u64,
+}
+
+/// Addresses tracked individually per window.
+const REJECT_TRACKED: usize = 4096;
+/// Addresses listed individually in a summary event.
+const REJECT_LISTED: usize = 100;
 
 impl std::fmt::Debug for Shared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -411,6 +434,7 @@ impl Shared {
             stream_seq: AtomicU32::new(1),
             admission: Mutex::new(()),
             login_failures: Mutex::new(HashMap::new()),
+            rejects: Mutex::new(RejectAgg::default()),
         }
     }
 
@@ -419,8 +443,93 @@ impl Shared {
     }
 
     /// Append an audit event; an error means the caller must refuse.
+    ///
+    /// The write is synchronous and durable. On a multi-threaded tokio
+    /// worker it runs under `block_in_place`, so other tasks move to other
+    /// workers while this one waits for the fsync; the caller still gets
+    /// the durable result before it proceeds (fail closed). Async code
+    /// should prefer [`Shared::audit_async`].
     pub fn audit(&self, ev: Event) -> Result<u64, ApiError> {
-        Ok(self.audit.append(ev)?)
+        let on_worker = tokio::runtime::Handle::try_current()
+            .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+            .unwrap_or(false);
+        if on_worker {
+            Ok(tokio::task::block_in_place(|| self.audit.append(ev))?)
+        } else {
+            Ok(self.audit.append(ev)?)
+        }
+    }
+
+    /// Append an audit event on a blocking thread and wait for the durable
+    /// result (fail closed: an error means the caller must refuse).
+    pub async fn audit_async(self: &Arc<Self>, ev: Event) -> Result<u64, ApiError> {
+        let sh = self.clone();
+        tokio::task::spawn_blocking(move || sh.audit.append(ev))
+            .await
+            .map_err(|e| ApiError::internal(format!("audit task: {e}")))?
+            .map_err(ApiError::from)
+    }
+
+    /// Record an unauthenticated rejection (aggregated, best effort: the
+    /// rejected party gets no access either way).
+    pub fn audit_reject(&self, peer: Option<&str>, data: serde_json::Value) {
+        let ip = peer.unwrap_or("unknown").to_string();
+        {
+            let mut g = self.rejects.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(n) = g.by_ip.get_mut(&ip) {
+                *n += 1;
+                return;
+            }
+            if g.by_ip.len() >= REJECT_TRACKED {
+                g.overflow += 1;
+                return;
+            }
+            g.by_ip.insert(ip.clone(), 0);
+        }
+        let _ = self.audit(
+            Event::new(
+                "gateway.reject",
+                "anonymous",
+                "gateway",
+                cjs_audit::Outcome::Denied,
+            )
+            .ip(Some(ip))
+            .data(data),
+        );
+    }
+
+    /// End the current rejection window: write one summary event for the
+    /// suppressed rejections (if any). Called once a minute.
+    pub fn flush_rejects(&self, window_secs: u64) -> Result<(), ApiError> {
+        let agg = std::mem::take(&mut *self.rejects.lock().unwrap_or_else(|p| p.into_inner()));
+        let mut ips: Vec<(String, u64)> = agg.by_ip.into_iter().filter(|(_, n)| *n > 0).collect();
+        let total: u64 = ips.iter().map(|(_, n)| n).sum::<u64>() + agg.overflow;
+        if total == 0 {
+            return Ok(());
+        }
+        ips.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let unlisted = ips.len().saturating_sub(REJECT_LISTED);
+        let listed: serde_json::Map<String, serde_json::Value> = ips
+            .into_iter()
+            .take(REJECT_LISTED)
+            .map(|(ip, n)| (ip, serde_json::json!(n)))
+            .collect();
+        self.audit(
+            Event::new(
+                "gateway.reject_summary",
+                "anonymous",
+                "gateway",
+                cjs_audit::Outcome::Denied,
+            )
+            .data(serde_json::json!({
+                "window_secs": window_secs,
+                "suppressed": total,
+                "by_ip": listed,
+                "unlisted_ips": unlisted,
+                "untracked": agg.overflow,
+            })),
+        )?;
+        Ok(())
     }
 
     /// Load an agent and check that it and its owner may act right now.

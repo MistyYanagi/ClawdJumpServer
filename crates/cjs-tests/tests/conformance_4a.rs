@@ -791,7 +791,10 @@ async fn c11_audit_chain_tamper_evidence_and_recordings() {
     assert!(offline.ok && offline.checkpoints >= 1, "{offline:?}");
     assert_eq!(offline.head, log.verify(None).unwrap().head);
     // A forged export (tampered checkpoint signature) fails offline.
-    let cp = text.lines().find(|l| l.contains("\"type\":\"checkpoint\"")).unwrap();
+    let cp = text
+        .lines()
+        .find(|l| l.contains("\"type\":\"checkpoint\""))
+        .unwrap();
     let sig = serde_json::from_str::<serde_json::Value>(cp).unwrap()["sig"]
         .as_str()
         .unwrap()

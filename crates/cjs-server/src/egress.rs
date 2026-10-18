@@ -53,7 +53,7 @@ pub async fn dial_first(addrs: &[SocketAddr]) -> Result<TcpStream, ProtoError> {
 }
 
 pub(crate) async fn server_egress(
-    sh: &Shared,
+    sh: &std::sync::Arc<Shared>,
     p: &Principal,
     info: &StreamInfo,
     dec: &Decision,
@@ -65,12 +65,13 @@ pub(crate) async fn server_egress(
     };
     let (ok, blocked) = resolve_allowed(&dec.egress_rules, host, *port).await?;
     if ok.is_empty() {
-        let _ = sh.audit(
+        let _ = sh.audit_async(
             Event::new("egress.blocked", &p.id, &info.target, Outcome::Denied)
                 .session(info.session.clone())
                 .ip(info.peer.clone())
                 .data(json!({"resolved": blocked.iter().map(|a| a.to_string()).collect::<Vec<_>>(), "reason": "address not allowed (SSRF guard)"})),
-        );
+        )
+        .await;
         return Err(ProtoError::new(
             ErrorCode::Forbidden,
             format!("{host} resolves only to addresses that are not allowed"),
@@ -78,12 +79,13 @@ pub(crate) async fn server_egress(
     }
     let mut tcp = dial_first(&ok).await?;
     let remote = tcp.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-    sh.audit(
+    sh.audit_async(
         Event::new("session.start", &p.id, &info.target, Outcome::Success)
             .session(info.session.clone())
             .ip(info.peer.clone())
             .data(json!({"stream": info.id, "kind": "egress", "via": "server", "remote": remote})),
     )
+    .await
     .map_err(|e| e.proto())?;
     write_msg(
         s,
@@ -96,25 +98,27 @@ pub(crate) async fn server_egress(
     *replied = true;
     let started = Instant::now();
     let (r, up, down) = relay_raw(s, &mut tcp, &info.cancel).await;
-    let _ = sh.audit(
-        Event::new(
-            "session.end",
-            &p.id,
-            &info.target,
-            if r.is_ok() {
-                Outcome::Success
-            } else {
-                Outcome::Failure
-            },
+    let _ = sh
+        .audit_async(
+            Event::new(
+                "session.end",
+                &p.id,
+                &info.target,
+                if r.is_ok() {
+                    Outcome::Success
+                } else {
+                    Outcome::Failure
+                },
+            )
+            .session(info.session.clone())
+            .ip(info.peer.clone())
+            .data(json!({
+                "bytes_up": up,
+                "bytes_down": down,
+                "remote": remote,
+                "duration_ms": started.elapsed().as_millis() as u64,
+            })),
         )
-        .session(info.session.clone())
-        .ip(info.peer.clone())
-        .data(json!({
-            "bytes_up": up,
-            "bytes_down": down,
-            "remote": remote,
-            "duration_ms": started.elapsed().as_millis() as u64,
-        })),
-    );
+        .await;
     r
 }
