@@ -19,18 +19,54 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use cjs_audit::{Event, Outcome};
-use cjs_authz::{ApprovalStatus, FullAccess, Grant, Role, Subject, Target};
+use cjs_authz::{ApprovalStatus, FullAccess, Grant, Role, RoleChange, Subject, Target};
 use cjs_proto::{ErrorCode, Role as ClientRole};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
 
 use crate::accounts::{self, random_token, sha256_hex};
-use crate::db::{new_id, now, Group, User};
+use crate::db::{new_id, now, Group, User, UserPatch};
 use crate::error::ApiError;
 use crate::gateway::Server;
 
 pub const COOKIE: &str = "cjs_session";
+/// Cookie name when cookies are `Secure` (TLS): the `__Host-` prefix pins
+/// the cookie to this host (no `Domain`, `Path=/`, HTTPS only).
+pub const SECURE_COOKIE: &str = "__Host-cjs_session";
+
+pub fn cookie_name(secure: bool) -> &'static str {
+    if secure {
+        SECURE_COOKIE
+    } else {
+        COOKIE
+    }
+}
+
+/// The address a trusted reverse proxy saw: the *rightmost* entry of
+/// `X-Forwarded-For` (the one the proxy appended). Entries to its left are
+/// supplied by the client and cannot be trusted.
+pub fn forwarded_client(xff: &str) -> Option<String> {
+    let last = xff.rsplit(',').next()?.trim();
+    last.parse::<std::net::IpAddr>().ok().map(|ip| ip.to_string())
+}
+
+/// Client address of an API request: the socket peer, or with
+/// `trust_forwarded` the proxy-appended `X-Forwarded-For` entry.
+pub fn client_ip(ext: &axum::http::Extensions, headers: &HeaderMap, trust_forwarded: bool) -> Option<String> {
+    if trust_forwarded {
+        let all: Vec<&str> = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        if let Some(last) = all.last().and_then(|v| forwarded_client(v)) {
+            return Some(last);
+        }
+    }
+    ext.get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip().to_string())
+}
 pub const CSRF_HEADER: &str = "x-csrf-token";
 /// Failed logins allowed per client address per window.
 const IP_MAX_FAILURES: u32 = 20;
@@ -130,8 +166,9 @@ impl FromRequestParts<Server> for Auth {
 
     async fn from_request_parts(parts: &mut Parts, srv: &Server) -> Result<Self, Self::Rejection> {
         let sh = &srv.shared;
-        let ip = cjs_transport::peer_addr(&parts.extensions, &parts.headers, sh.cfg.trust_forwarded_for);
-        let token = cookie_value(&parts.headers, COOKIE).ok_or_else(|| ApiError::unauth("not logged in"))?;
+        let ip = client_ip(&parts.extensions, &parts.headers, sh.cfg.trust_forwarded_for);
+        let token = cookie_value(&parts.headers, cookie_name(sh.cfg.secure_cookies))
+            .ok_or_else(|| ApiError::unauth("not logged in"))?;
         let hash = sha256_hex(&token);
         let (uid, csrf, created, last) = sh
             .db
@@ -146,7 +183,9 @@ impl FromRequestParts<Server> for Auth {
             .db
             .user(&uid)?
             .ok_or_else(|| ApiError::unauth("session expired"))?;
-        if let Err(why) = user.usable(t) {
+        // A login lockout does not end existing sessions; disable and
+        // expiry do.
+        if let Err(why) = user.active(t) {
             sh.db.delete_web_session(&hash)?;
             return Err(ApiError::new(ErrorCode::Disabled, why));
         }
@@ -177,7 +216,8 @@ impl FromRequestParts<Server> for Auth {
 
 fn session_cookie(token: &str, max_age: i64, secure: bool) -> HeaderValue {
     let s = format!(
-        "{COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{}",
+        "{}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{}",
+        cookie_name(secure),
         if secure { "; Secure" } else { "" }
     );
     HeaderValue::from_str(&s).unwrap_or_else(|_| HeaderValue::from_static(""))
@@ -216,13 +256,31 @@ pub const ROUTES: &[(&str, &str, &str, &str)] = &[
         "patch",
         "/api/v1/users/{id}",
         "sysadmin",
-        "Change status, roles, display name or expiry",
+        "Change status, roles, display name or expiry (granting a role needs secadmin approval)",
     ),
     (
         "post",
         "/api/v1/users/{id}/reset",
         "sysadmin",
-        "Reset password and TOTP",
+        "Reset password and TOTP (users without roles; others only on the server host)",
+    ),
+    (
+        "get",
+        "/api/v1/role-changes",
+        "sysadmin|secadmin|auditor",
+        "List requested role changes",
+    ),
+    (
+        "post",
+        "/api/v1/role-changes/{id}/approve",
+        "secadmin",
+        "Approve a role change (not the requester, not the user)",
+    ),
+    (
+        "post",
+        "/api/v1/role-changes/{id}/reject",
+        "secadmin|requester",
+        "Reject or withdraw a pending role change",
     ),
     (
         "post",
@@ -248,7 +306,12 @@ pub const ROUTES: &[(&str, &str, &str, &str)] = &[
         "sysadmin|owner",
         "Delete an agent",
     ),
-    ("get", "/api/v1/devices", "any", "List devices"),
+    (
+        "get",
+        "/api/v1/devices",
+        "any",
+        "List devices (others: only devices their agents are granted)",
+    ),
     (
         "patch",
         "/api/v1/devices/{id}",
@@ -256,7 +319,12 @@ pub const ROUTES: &[(&str, &str, &str, &str)] = &[
         "Enable or disable a device",
     ),
     ("delete", "/api/v1/devices/{id}", "sysadmin", "Delete a device"),
-    ("get", "/api/v1/groups", "any", "List groups"),
+    (
+        "get",
+        "/api/v1/groups",
+        "any",
+        "List groups (others: only groups of themselves and their agents)",
+    ),
     (
         "post",
         "/api/v1/groups",
@@ -379,6 +447,9 @@ pub fn router(srv: Server) -> Router {
         .route("/api/v1/users/{id}", axum::routing::patch(patch_user))
         .route("/api/v1/users/{id}/reset", post(reset_user))
         .route("/api/v1/users/{id}/unlock", post(unlock_user))
+        .route("/api/v1/role-changes", get(list_role_changes))
+        .route("/api/v1/role-changes/{id}/approve", post(approve_role_change))
+        .route("/api/v1/role-changes/{id}/reject", post(reject_role_change))
         .route("/api/v1/agents", get(list_agents))
         .route(
             "/api/v1/agents/{id}",
@@ -437,16 +508,19 @@ async fn login(
     Body(req): Body<LoginReq>,
 ) -> R<Response> {
     let sh = &srv.shared;
-    let ip = cjs_transport::peer_addr(&ext, &headers, sh.cfg.trust_forwarded_for);
+    let ip = client_ip(&ext, &headers, sh.cfg.trust_forwarded_for);
     if !same_origin(&headers) {
         return Err(ApiError::forbidden("cross-origin request refused"));
     }
     let key = ip.clone().unwrap_or_else(|| "unknown".into());
     let t = now();
+    // Reserve this attempt against the per-address budget *before* the
+    // credentials are checked, so concurrent requests cannot all slip in.
     {
         let mut f = sh.login_failures.lock().unwrap_or_else(|p| p.into_inner());
         f.retain(|_, (_, start)| t - *start < IP_WINDOW_SECS);
-        if f.get(&key).map(|(n, _)| *n >= IP_MAX_FAILURES).unwrap_or(false) {
+        let entry = f.entry(key.clone()).or_insert((0, t));
+        if entry.0 >= IP_MAX_FAILURES {
             drop(f);
             let _ = sh.audit(
                 Event::new("auth.login", "anonymous", "web", Outcome::Denied)
@@ -458,18 +532,24 @@ async fn login(
                 "too many failed logins; try again later",
             ));
         }
+        entry.0 += 1;
     }
-    let user = match accounts::login(&sh.db, &sh.audit, &req.name, &req.password, &req.totp, ip.clone()) {
-        Ok(u) => u,
-        Err(e) => {
-            if e.code != ErrorCode::AuditFailure {
-                let mut f = sh.login_failures.lock().unwrap_or_else(|p| p.into_inner());
-                let entry = f.entry(key).or_insert((0, t));
-                entry.0 += 1;
-            }
-            return Err(e);
+    let res = accounts::login(&sh.db, &sh.audit, &req.name, &req.password, &req.totp, ip.clone());
+    if res
+        .as_ref()
+        .map(|_| true)
+        .unwrap_or_else(|e| e.code == ErrorCode::AuditFailure)
+    {
+        // Not a failed guess: give the reservation back.
+        let mut f = sh.login_failures.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(e) = f.get_mut(&key) {
+            e.0 = e.0.saturating_sub(1);
         }
-    };
+    }
+    let user = res?;
+    let _ = sh
+        .db
+        .purge_web_sessions(sh.cfg.web_idle_secs, sh.cfg.web_max_secs);
     let token = random_token(32);
     let csrf = random_token(32);
     sh.db
@@ -509,17 +589,28 @@ async fn change_password(
     Body(req): Body<PasswordReq>,
 ) -> R<Json<Value>> {
     let sh = &srv.shared;
-    let mut u = auth.user.clone();
-    if !accounts::verify_password(&req.old, &u.password_hash) {
-        return Err(ApiError::unauth("wrong password"));
-    }
-    let step = accounts::check_totp(&u.totp_secret, &req.totp, u.last_totp_step)
-        .ok_or_else(|| ApiError::unauth("bad or reused TOTP code"))?;
     accounts::check_password_policy(&req.new)?;
+    // Same checks, lockout counting and answer as a login.
+    let u = sh
+        .db
+        .user(&auth.user.id)?
+        .ok_or_else(|| ApiError::unauth("session expired"))?;
+    if let Err(reason) = accounts::check_credentials(&sh.db, &u, &req.old, &req.totp)? {
+        sh.audit(
+            Event::new("auth.password_change", &u.id, &u.id, Outcome::Denied)
+                .ip(auth.ip.clone())
+                .data(json!({"reason": reason})),
+        )?;
+        return Err(ApiError::forbidden("invalid credentials"));
+    }
     sh.audit(auth.event("auth.password_change", &u.id))?;
-    u.password_hash = accounts::hash_password(&req.new)?;
-    u.last_totp_step = step;
-    sh.db.update_user(&u)?;
+    let new_hash = accounts::hash_password(&req.new)?;
+    if !sh.db.set_password(&u.id, &u.password_hash, &new_hash)? {
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            "the password was changed concurrently",
+        ));
+    }
     // Other sessions of this user end; this one stays.
     sh.db.delete_user_sessions(&u.id)?;
     sh.db
@@ -567,13 +658,49 @@ fn new_credentials(u: &User, password: &str, secret: &str) -> Value {
     })
 }
 
+/// Request a change of `u`'s roles to `roles`. Changes that only remove
+/// roles are returned as `None` (apply directly); changes that grant a
+/// privileged role are stored as pending and audited.
+fn request_role_change(srv: &Server, auth: &Auth, u: &User, roles: &[Role]) -> R<Option<RoleChange>> {
+    cjs_authz::validate_roles(roles).map_err(ApiError::bad)?;
+    let added = cjs_authz::added_roles(&u.roles, roles);
+    if !added.iter().any(|r| cjs_authz::PRIVILEGED_ROLES.contains(r)) {
+        return Ok(None);
+    }
+    let mut roles = roles.to_vec();
+    roles.sort();
+    roles.dedup();
+    let rc = RoleChange {
+        id: new_id("rc"),
+        user_id: u.id.clone(),
+        user_name: u.name.clone(),
+        from_roles: u.roles.clone(),
+        roles,
+        requested_by: auth.user.id.clone(),
+        status: ApprovalStatus::Pending,
+        decided_by: None,
+        decided_at: None,
+        created_at: now(),
+    };
+    srv.shared.audit(
+        auth.event("admin.role_change.request", &u.id)
+            .highlight(true)
+            .data(serde_json::to_value(&rc).unwrap_or_default()),
+    )?;
+    srv.shared.db.insert_role_change(&rc)?;
+    Ok(Some(rc))
+}
+
 async fn create_user(State(srv): State<Server>, auth: Auth, Body(req): Body<CreateUser>) -> R<Json<Value>> {
     auth.require(Role::Sysadmin)?;
     let sh = &srv.shared;
     if sh.db.user(&req.name)?.is_some() {
         return Err(ApiError::new(ErrorCode::Conflict, "user exists"));
     }
-    let mut nu = accounts::create_user(&req.name, req.roles.clone(), None)?;
+    cjs_authz::validate_roles(&req.roles).map_err(ApiError::bad)?;
+    // The account starts without roles: every role is privileged and needs
+    // a second person (a secadmin) to approve it.
+    let mut nu = accounts::create_user(&req.name, vec![], None)?;
     if let Some(d) = req.display_name {
         nu.user.display_name = d;
     }
@@ -581,10 +708,13 @@ async fn create_user(State(srv): State<Server>, auth: Auth, Body(req): Body<Crea
     sh.audit(
         auth.event("admin.user.create", &nu.user.id)
             .highlight(!req.roles.is_empty())
-            .data(json!({"name": nu.user.name, "roles": req.roles, "expires_at": req.expires_at})),
+            .data(json!({"name": nu.user.name, "requested_roles": req.roles, "expires_at": req.expires_at})),
     )?;
     sh.db.insert_user(&nu.user)?;
-    Ok(Json(new_credentials(&nu.user, &nu.password, &nu.totp_secret)))
+    let pending = request_role_change(&srv, &auth, &nu.user, &req.roles)?;
+    let mut v = new_credentials(&nu.user, &nu.password, &nu.totp_secret);
+    v["pending_role_change"] = json!(pending);
+    Ok(Json(v))
 }
 
 #[derive(Deserialize)]
@@ -611,47 +741,69 @@ async fn patch_user(
 ) -> R<Json<Value>> {
     auth.require(Role::Sysadmin)?;
     let sh = &srv.shared;
-    let mut u = load_user(&srv, &id)?;
-    if u.id == auth.user.id && (req.status.is_some() || req.roles.is_some()) {
+    let u = load_user(&srv, &id)?;
+    if u.id == auth.user.id && (req.status.is_some() || req.roles.is_some() || req.expires_at.is_some()) {
         return Err(ApiError::forbidden(
-            "you cannot change your own status or roles; ask another administrator",
+            "you cannot change your own status, roles or expiry; ask another administrator",
         ));
     }
     if let Some(s) = &req.status {
         if s != "active" && s != "disabled" {
             return Err(ApiError::bad("status must be active or disabled"));
         }
-        u.status = s.clone();
     }
+    // Granting a role only creates a pending request; removing roles
+    // applies at once.
+    let mut pending = None;
+    let mut direct_roles = None;
     if let Some(r) = &req.roles {
-        cjs_authz::validate_roles(r).map_err(ApiError::bad)?;
-        u.roles = r.clone();
+        pending = request_role_change(&srv, &auth, &u, r)?;
+        if pending.is_none() {
+            direct_roles = Some(r.clone());
+        }
     }
-    if let Some(d) = &req.display_name {
-        u.display_name = d.clone();
+    let patch = UserPatch {
+        status: req.status.as_deref(),
+        roles: direct_roles.as_deref(),
+        display_name: req.display_name.as_deref(),
+        expires_at: req.expires_at.map(|e| (e != 0).then_some(e)),
+    };
+    let changes = patch.status.is_some()
+        || patch.roles.is_some()
+        || patch.display_name.is_some()
+        || patch.expires_at.is_some();
+    let mut out = u.clone();
+    if changes {
+        sh.audit(
+            auth.event("admin.user.update", &u.id)
+                .highlight(direct_roles.is_some() || req.status.is_some())
+                .data(json!({"name": u.name, "status": req.status, "roles": direct_roles, "expires_at": req.expires_at})),
+        )?;
+        out = sh.db.patch_user(&u.id, &patch, now())?;
+        out.groups = u.groups.clone();
+        if out.active(now()).is_err() {
+            sh.db.delete_user_sessions(&u.id)?;
+        }
+        srv.enforce();
     }
-    if let Some(e) = req.expires_at {
-        u.expires_at = (e != 0).then_some(e);
-    }
-    sh.audit(
-        auth.event("admin.user.update", &u.id)
-            .highlight(req.roles.is_some() || req.status.is_some())
-            .data(json!({"name": u.name, "status": req.status, "roles": req.roles, "expires_at": req.expires_at})),
-    )?;
-    sh.db.update_user(&u)?;
-    if u.status != "active" {
-        sh.db.delete_user_sessions(&u.id)?;
-    }
-    srv.enforce();
-    Ok(Json(user_json(&u)))
+    let mut v = user_json(&out);
+    v["pending_role_change"] = json!(pending);
+    Ok(Json(v))
 }
 
 async fn reset_user(State(srv): State<Server>, auth: Auth, Path(id): Path<String>) -> R<Json<Value>> {
     auth.require(Role::Sysadmin)?;
     let sh = &srv.shared;
-    let mut u = load_user(&srv, &id)?;
+    let u = load_user(&srv, &id)?;
     if u.id == auth.user.id {
         return Err(ApiError::forbidden("use the password change instead"));
+    }
+    if !u.roles.is_empty() {
+        // The new credentials would be handed to the requester, who could
+        // then act as that administrator, secadmin or auditor.
+        return Err(ApiError::forbidden(
+            "credentials of users with roles can only be reset on the server host (cjs-server reset-user)",
+        ));
     }
     let password = accounts::random_password();
     let secret = accounts::new_totp_secret();
@@ -660,25 +812,83 @@ async fn reset_user(State(srv): State<Server>, auth: Auth, Path(id): Path<String
             .highlight(true)
             .data(json!({"name": u.name})),
     )?;
-    u.password_hash = accounts::hash_password(&password)?;
-    u.totp_secret = secret.clone();
-    u.last_totp_step = 0;
-    u.failed_logins = 0;
-    u.locked_until = None;
-    sh.db.update_user(&u)?;
+    sh.db
+        .reset_credentials(&u.id, &accounts::hash_password(&password)?, &secret)?;
     sh.db.delete_user_sessions(&u.id)?;
+    let u = load_user(&srv, &u.id)?;
     Ok(Json(new_credentials(&u, &password, &secret)))
 }
 
 async fn unlock_user(State(srv): State<Server>, auth: Auth, Path(id): Path<String>) -> R<Json<Value>> {
     auth.require(Role::Sysadmin)?;
     let sh = &srv.shared;
-    let mut u = load_user(&srv, &id)?;
+    let u = load_user(&srv, &id)?;
     sh.audit(auth.event("admin.user.unlock", &u.id))?;
-    u.failed_logins = 0;
-    u.locked_until = None;
-    sh.db.update_user(&u)?;
-    Ok(Json(user_json(&u)))
+    sh.db.unlock_user(&u.id)?;
+    Ok(Json(user_json(&load_user(&srv, &u.id)?)))
+}
+
+// ---------------------------------------------------------------------------
+// Role changes (two-person rule for privileged roles)
+// ---------------------------------------------------------------------------
+
+async fn list_role_changes(State(srv): State<Server>, auth: Auth) -> R<Json<Value>> {
+    auth.require_any(&[Role::Sysadmin, Role::Secadmin, Role::Auditor])?;
+    Ok(Json(json!(srv.shared.db.role_changes()?)))
+}
+
+fn load_role_change(srv: &Server, id: &str) -> R<RoleChange> {
+    srv.shared
+        .db
+        .role_change(id)?
+        .ok_or_else(|| ApiError::not_found("no such request"))
+}
+
+async fn approve_role_change(
+    State(srv): State<Server>,
+    auth: Auth,
+    Path(id): Path<String>,
+) -> R<Json<Value>> {
+    auth.require(Role::Secadmin)?;
+    let sh = &srv.shared;
+    let mut rc = load_role_change(&srv, &id)?;
+    let t = now();
+    rc.approve(&auth.user.id, &auth.user.roles, t)
+        .map_err(ApiError::forbidden)?;
+    sh.audit(
+        auth.event("admin.role_change.approve", &rc.user_id)
+            .highlight(true)
+            .data(serde_json::to_value(&rc).unwrap_or_default()),
+    )?;
+    sh.db.apply_role_change(&rc, t)?;
+    srv.enforce();
+    Ok(Json(json!(rc)))
+}
+
+async fn reject_role_change(State(srv): State<Server>, auth: Auth, Path(id): Path<String>) -> R<Json<Value>> {
+    let sh = &srv.shared;
+    let mut rc = load_role_change(&srv, &id)?;
+    if rc.requested_by != auth.user.id {
+        auth.require(Role::Secadmin)?;
+    }
+    if rc.status != ApprovalStatus::Pending {
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            format!("request is {}", rc.status.as_str()),
+        ));
+    }
+    rc.status = ApprovalStatus::Rejected;
+    rc.decided_by = Some(auth.user.id.clone());
+    rc.decided_at = Some(now());
+    sh.audit(
+        auth.event("admin.role_change.reject", &rc.user_id)
+            .highlight(true)
+            .data(serde_json::to_value(&rc).unwrap_or_default()),
+    )?;
+    if !sh.db.reject_role_change(&rc)? {
+        return Err(ApiError::new(ErrorCode::Conflict, "request is no longer pending"));
+    }
+    Ok(Json(json!(rc)))
 }
 
 // ---------------------------------------------------------------------------
@@ -757,8 +967,18 @@ async fn delete_agent(State(srv): State<Server>, auth: Auth, Path(id): Path<Stri
         .db
         .agent(&id)?
         .ok_or_else(|| ApiError::not_found("no such agent"))?;
-    if !auth.user.has(Role::Sysadmin) && a.owner_id != auth.user.id {
-        return Err(ApiError::forbidden("not your agent"));
+    if !auth.user.has(Role::Sysadmin) {
+        if a.owner_id != auth.user.id {
+            return Err(ApiError::forbidden("not your agent"));
+        }
+        // A disabled agent stays until a sysadmin removes it (and its key
+        // is then revoked), so an owner cannot undo a disable by deleting
+        // and re-enrolling.
+        if a.status != "active" {
+            return Err(ApiError::forbidden(
+                "a disabled agent can only be deleted by a sysadmin",
+            ));
+        }
     }
     sh.audit(
         auth.event("admin.agent.delete", &a.id)
@@ -770,15 +990,64 @@ async fn delete_agent(State(srv): State<Server>, auth: Auth, Path(id): Path<Stri
     Ok(Json(json!({"ok": true})))
 }
 
-async fn list_devices(State(srv): State<Server>, _auth: Auth) -> R<Json<Value>> {
+fn sees_inventory(auth: &Auth) -> bool {
+    auth.user.has(Role::Sysadmin) || auth.user.has(Role::Secadmin) || auth.user.has(Role::Auditor)
+}
+
+/// Ids of the devices on which one of `owner`'s agents has any grant now.
+fn granted_devices(srv: &Server, owner: &str) -> R<BTreeSet<String>> {
+    let db = &srv.shared.db;
+    let agents: Vec<_> = db.agents()?.into_iter().filter(|a| a.owner_id == owner).collect();
+    let mut out = BTreeSet::new();
+    if agents.is_empty() {
+        return Ok(out);
+    }
+    let grants: Vec<_> = db.grants()?.into_iter().map(|g| g.grant).collect();
+    let full = db.full_access_all()?;
+    let t = now();
+    let zero = |_: &str| 0u32;
+    for d in db.devices()? {
+        for a in &agents {
+            let ar = cjs_authz::AccessRequest {
+                principal: &a.id,
+                principal_groups: &a.groups,
+                device: Some(&d.id),
+                device_groups: &d.groups,
+                action: cjs_proto::Action::Shell,
+                net: None,
+                active: &zero,
+                now: t,
+            };
+            if !cjs_authz::visible(&ar, &grants, &full).actions.is_empty() {
+                out.insert(d.id.clone());
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+async fn list_devices(State(srv): State<Server>, auth: Auth) -> R<Json<Value>> {
     let sh = &srv.shared;
+    let all = sees_inventory(&auth);
+    let mine = if all {
+        BTreeSet::new()
+    } else {
+        granted_devices(&srv, &auth.user.id)?
+    };
     let v: Vec<Value> = sh
         .db
         .devices()?
         .into_iter()
+        .filter(|d| all || mine.contains(&d.id))
         .map(|d| {
             let mut v = serde_json::to_value(&d).unwrap_or_default();
             v["online"] = json!(sh.reg.is_online(&d.id));
+            if !all {
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("pubkey");
+                }
+            }
             v
         })
         .collect();
@@ -832,8 +1101,30 @@ async fn delete_device(State(srv): State<Server>, auth: Auth, Path(id): Path<Str
 // Groups
 // ---------------------------------------------------------------------------
 
-async fn list_groups(State(srv): State<Server>, _auth: Auth) -> R<Json<Value>> {
-    Ok(Json(json!(srv.shared.db.groups()?)))
+async fn list_groups(State(srv): State<Server>, auth: Auth) -> R<Json<Value>> {
+    let db = &srv.shared.db;
+    if sees_inventory(&auth) {
+        return Ok(Json(json!(db.groups()?)));
+    }
+    // Others see only the groups they or their agents belong to, and only
+    // themselves / their agents as members.
+    let mut own: BTreeSet<String> = db
+        .agents()?
+        .into_iter()
+        .filter(|a| a.owner_id == auth.user.id)
+        .map(|a| a.id)
+        .collect();
+    own.insert(auth.user.id.clone());
+    let v: Vec<Group> = db
+        .groups()?
+        .into_iter()
+        .filter(|g| g.members.iter().any(|m| own.contains(m)))
+        .map(|mut g| {
+            g.members.retain(|m| own.contains(m));
+            g
+        })
+        .collect();
+    Ok(Json(json!(v)))
 }
 
 #[derive(Deserialize)]
@@ -1203,7 +1494,9 @@ async fn approve_full(State(srv): State<Server>, auth: Auth, Path(id): Path<Stri
             .highlight(true)
             .data(serde_json::to_value(&f).unwrap_or_default()),
     )?;
-    sh.db.put_full_access(&f)?;
+    if !sh.db.transition_full_access(&f, ApprovalStatus::Pending)? {
+        return Err(ApiError::new(ErrorCode::Conflict, "request is no longer pending"));
+    }
     Ok(Json(json!(f)))
 }
 
@@ -1222,6 +1515,7 @@ async fn decide_full(srv: &Server, auth: &Auth, id: &str, to: ApprovalStatus) ->
             format!("request is {}", f.status.as_str()),
         ));
     }
+    let from = f.status;
     f.status = to;
     f.decided_at = Some(now());
     if to == ApprovalStatus::Revoked {
@@ -1232,7 +1526,9 @@ async fn decide_full(srv: &Server, auth: &Auth, id: &str, to: ApprovalStatus) ->
             .highlight(true)
             .data(serde_json::to_value(&f).unwrap_or_default()),
     )?;
-    sh.db.put_full_access(&f)?;
+    if !sh.db.transition_full_access(&f, from)? {
+        return Err(ApiError::new(ErrorCode::Conflict, "request changed concurrently"));
+    }
     srv.enforce();
     Ok(Json(json!(f)))
 }
@@ -1413,7 +1709,8 @@ pub fn openapi_doc() -> Value {
         "info": {"title": "ClawdJumpServer API", "version": env!("CARGO_PKG_VERSION")},
         "paths": paths,
         "components": {
-            "securitySchemes": {"session": {"type": "apiKey", "in": "cookie", "name": COOKIE}},
+            "securitySchemes": {"session": {"type": "apiKey", "in": "cookie", "name": COOKIE,
+                "description": "Named __Host-cjs_session when the server uses TLS"}},
             "schemas": {"Error": {"type": "object", "properties": {"error": {"type": "object", "properties": {
                 "code": {"type": "string"}, "message": {"type": "string"}}}}}}
         },
@@ -1423,4 +1720,43 @@ pub fn openapi_doc() -> Value {
 
 async fn openapi() -> Json<Value> {
     Json(openapi_doc())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forwarded_for_uses_proxy_appended_entry() {
+        assert_eq!(forwarded_client("6.6.6.6, 10.0.0.7").as_deref(), Some("10.0.0.7"));
+        assert_eq!(forwarded_client("10.0.0.7").as_deref(), Some("10.0.0.7"));
+        assert_eq!(forwarded_client("1.2.3.4, garbage"), None);
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", HeaderValue::from_static("6.6.6.6"));
+        h.append("x-forwarded-for", HeaderValue::from_static("1.1.1.1, 192.0.2.9"));
+        let ext = axum::http::Extensions::new();
+        assert_eq!(client_ip(&ext, &h, true).as_deref(), Some("192.0.2.9"));
+        assert_eq!(client_ip(&ext, &h, false), None);
+    }
+
+    #[test]
+    fn secure_cookie_uses_host_prefix() {
+        let c = session_cookie("t", 10, true);
+        let c = c.to_str().unwrap();
+        assert!(c.starts_with("__Host-cjs_session=t;") && c.contains("; Secure") && c.contains("Path=/"));
+        assert!(!c.contains("Domain"));
+        assert!(session_cookie("t", 10, false)
+            .to_str()
+            .unwrap()
+            .starts_with("cjs_session=t;"));
+    }
+
+    #[test]
+    fn openapi_lists_every_route() {
+        let doc = openapi_doc();
+        for (m, p, _, _) in ROUTES {
+            assert!(doc["paths"][*p][*m].is_object(), "{m} {p}");
+        }
+        assert!(doc["paths"]["/api/v1/role-changes/{id}/approve"]["post"].is_object());
+    }
 }

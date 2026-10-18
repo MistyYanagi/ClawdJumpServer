@@ -11,7 +11,7 @@ use cjs_transport::{Accepted, Authenticator, TransportServer, TransportServerCon
 use serde_json::json;
 
 use crate::accounts::sha256_hex;
-use crate::db::{new_id, now, Agent, Device};
+use crate::db::{new_id, now, Agent, Device, Enrollee};
 use crate::keys::Keys;
 use crate::state::{ConnInfo, ServerConfig, Shared};
 use crate::{db::Db, relay};
@@ -96,24 +96,7 @@ impl GatewayAuth {
             return Err(ProtoError::new(ErrorCode::Expired, "enrollment token expired"));
         }
         let id = new_id(if role == Role::Agent { "a" } else { "d" });
-        if !sh.db.consume_enroll_token(&t.id, &id).map_err(|e| e.proto())? {
-            return Err(ProtoError::new(
-                ErrorCode::Replay,
-                "enrollment token already used",
-            ));
-        }
         let info = serde_json::to_value(&hello.info).unwrap_or_default();
-        sh.audit(
-            Event::new(
-                &format!("enroll.{}", role_str(role)),
-                &id,
-                &t.name,
-                Outcome::Success,
-            )
-            .ip(peer.map(String::from))
-            .data(json!({"token": t.id, "name": t.name, "owner": t.owner_id, "pubkey": pk, "info": info})),
-        )
-        .map_err(|e| e.proto())?;
         let created_at = now();
         let agent = Agent {
             id: id.clone(),
@@ -132,20 +115,36 @@ impl GatewayAuth {
             name: t.name.clone(),
             pubkey: pk.into(),
             status: "active".into(),
-            info,
+            info: info.clone(),
             last_seen: None,
             created_at,
             groups: vec![],
         };
-        match role {
+        let who = match role {
             Role::Agent => {
                 if agent.owner_id.is_empty() {
                     return Err(ProtoError::new(ErrorCode::BadRequest, "agent token has no owner"));
                 }
-                sh.db.insert_agent(&agent).map_err(|e| e.proto())?
+                Enrollee::Agent(&agent)
             }
-            Role::Device => sh.db.insert_device(&device).map_err(|e| e.proto())?,
-        }
+            Role::Device => Enrollee::Device(&device),
+        };
+        // Token consumption, the insert and the success audit commit together.
+        sh.db
+            .enroll_principal(&t.id, who, || {
+                sh.audit(
+                    Event::new(
+                        &format!("enroll.{}", role_str(role)),
+                        &id,
+                        &t.name,
+                        Outcome::Success,
+                    )
+                    .ip(peer.map(String::from))
+                    .data(json!({"token": t.id, "name": t.name, "owner": t.owner_id, "pubkey": pk, "info": info})),
+                )
+                .map(|_| ())
+            })
+            .map_err(|e| e.proto())?;
         Ok((agent, device))
     }
 }

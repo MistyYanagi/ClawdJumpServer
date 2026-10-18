@@ -227,8 +227,19 @@ async fn c03_login_needs_password_and_totp_with_lockout() {
     }
     let next = cjs_server::accounts::code_for_step(&secret, step + 1);
     let (st, v) = login(pw, next).await;
-    assert_eq!(st, 429, "{v}");
-    assert_eq!(v["error"]["code"], "limit_exceeded");
+    // A locked account answers exactly like a wrong password (no
+    // enumeration); the lock is recorded in the audit log only.
+    assert_eq!(st, 401, "{v}");
+    assert_eq!(v["error"]["message"], "invalid credentials");
+    assert!(env
+        .server
+        .shared
+        .db
+        .user("bob")
+        .unwrap()
+        .unwrap()
+        .locked_until
+        .is_some());
     // Unknown users get the same answer as wrong passwords.
     let r = http
         .post(format!("{}api/v1/login", env.url))
@@ -788,4 +799,340 @@ async fn c11_audit_chain_tamper_evidence_and_recordings() {
     .unwrap();
     let report = log.verify(None).unwrap();
     assert!(!report.ok, "tampering must be detected");
+}
+
+/// A6b — Separation of duties: granting a role through the API is only a
+/// request; a secadmin other than the requester and the user approves it.
+/// Administrators' credentials cannot be reset through the API.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn c12_privileged_roles_need_a_second_secadmin() {
+    let env = Env::start(mode()).await;
+    env.add_user("sys", vec![Role::Sysadmin]);
+    env.add_user("sec2", vec![Role::Secadmin]);
+    env.add_user("aud", vec![Role::Auditor]);
+    let sys = env.web("sys").await;
+    let admin = env.web("admin").await; // sysadmin + secadmin
+    let sec2 = env.web("sec2").await;
+    // A sysadmin creates an "auditor": the account starts without roles.
+    let (st, v) = sys
+        .call(
+            "POST",
+            "/users",
+            Some(json!({"name": "eve", "roles": ["auditor"]})),
+        )
+        .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["user"]["roles"], json!([]));
+    let rc = v["pending_role_change"]["id"].as_str().unwrap().to_string();
+    let eve = env.server.shared.db.user("eve").unwrap().unwrap();
+    assert!(eve.roles.is_empty());
+    // Using the returned credentials gives no audit access.
+    env.creds.lock().unwrap().insert(
+        "eve".into(),
+        (
+            eve.id.clone(),
+            v["password"].as_str().unwrap().into(),
+            v["totp_secret"].as_str().unwrap().into(),
+        ),
+    );
+    let eve_web = env.web("eve").await;
+    assert_eq!(eve_web.call("GET", "/audit", None).await.0, 403);
+    // Neither the requester nor a non-secadmin can approve.
+    let approve = format!("/role-changes/{rc}/approve");
+    assert_eq!(sys.call("POST", &approve, Some(json!({}))).await.0, 403);
+    assert_eq!(eve_web.call("POST", &approve, Some(json!({}))).await.0, 403);
+    // Another secadmin approves; then the role is effective.
+    let (st, v) = admin.call("POST", &approve, Some(json!({}))).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["status"], "approved");
+    assert_eq!(eve_web.call("GET", "/audit", None).await.0, 200);
+    assert_eq!(admin.call("POST", &approve, Some(json!({}))).await.0, 403);
+    // PATCH that grants a role is pending too; the requester cannot approve
+    // even when they are a secadmin themselves.
+    let (alice_id, _, _) = env.cred("alice");
+    let (st, v) = admin
+        .call(
+            "PATCH",
+            &format!("/users/{alice_id}"),
+            Some(json!({"roles": ["secadmin"]})),
+        )
+        .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["roles"], json!([]));
+    let rc = v["pending_role_change"]["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        admin
+            .call("POST", &format!("/role-changes/{rc}/approve"), Some(json!({})))
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        sec2.call("POST", &format!("/role-changes/{rc}/reject"), Some(json!({})))
+            .await
+            .0,
+        200
+    );
+    assert!(env
+        .server
+        .shared
+        .db
+        .user(&alice_id)
+        .unwrap()
+        .unwrap()
+        .roles
+        .is_empty());
+    let (_, list) = sec2.call("GET", "/role-changes", None).await;
+    assert_eq!(list.as_array().unwrap().len(), 2);
+    // Credentials of a user with roles cannot be reset through the API.
+    let (aud_id, _, _) = env.cred("aud");
+    assert_eq!(
+        sys.call("POST", &format!("/users/{aud_id}/reset"), Some(json!({})))
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        sys.call("POST", &format!("/users/{alice_id}/reset"), Some(json!({})))
+            .await
+            .0,
+        200
+    );
+    let kinds = env.audit_kinds();
+    for k in [
+        "admin.role_change.request",
+        "admin.role_change.approve",
+        "admin.role_change.reject",
+    ] {
+        assert!(kinds.iter().any(|(x, _)| x == k), "{k} audited");
+    }
+}
+
+/// A6c — The last active secadmin and the last active auditor cannot be
+/// disabled, expired or lose the role; nobody can change their own expiry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn c13_last_holder_protection_and_no_self_expiry() {
+    let env = Env::start(mode()).await;
+    env.add_user("sys", vec![Role::Sysadmin]);
+    env.add_user("aud", vec![Role::Auditor]);
+    let sys = env.web("sys").await;
+    let (aud_id, _, _) = env.cred("aud");
+    for body in [
+        json!({"status": "disabled"}),
+        json!({"expires_at": cjs_server::db::now() + 3600}),
+        json!({"roles": []}),
+    ] {
+        let (st, v) = sys.call("PATCH", &format!("/users/{aud_id}"), Some(body)).await;
+        assert_eq!(st, 409, "{v}");
+    }
+    // admin is the only secadmin.
+    let admin_path = format!("/users/{}", env.admin);
+    let (st, _) = sys
+        .call("PATCH", &admin_path, Some(json!({"status": "disabled"})))
+        .await;
+    assert_eq!(st, 409);
+    let (st, _) = sys
+        .call("PATCH", &admin_path, Some(json!({"roles": ["sysadmin"]})))
+        .await;
+    assert_eq!(st, 409);
+    // With a second auditor, the first may go.
+    env.add_user("aud2", vec![Role::Auditor]);
+    let (st, _) = sys
+        .call(
+            "PATCH",
+            &format!("/users/{aud_id}"),
+            Some(json!({"status": "disabled"})),
+        )
+        .await;
+    assert_eq!(st, 200);
+    // No self-expiry.
+    let (sys_id, _, _) = env.cred("sys");
+    let (st, _) = sys
+        .call(
+            "PATCH",
+            &format!("/users/{sys_id}"),
+            Some(json!({"expires_at": 0})),
+        )
+        .await;
+    assert_eq!(st, 403);
+}
+
+/// A3b/A4b — Lockout blocks new logins but keeps existing sessions; the
+/// password change answers like a login and counts toward the lockout;
+/// the per-address budget is reserved before credentials are checked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn c14_lockout_sessions_password_change_and_ip_budget() {
+    let env = Env::start(mode()).await;
+    let alice = env.web("alice").await;
+    let (alice_id, pw, secret) = env.cred("alice");
+    let db = &env.server.shared.db;
+    let until = cjs_server::db::now() + 600;
+    db.with(|c| {
+        c.execute(
+            "UPDATE users SET locked_until = ?2 WHERE id = ?1",
+            (&alice_id, until),
+        )
+    })
+    .unwrap();
+    assert_eq!(alice.call("GET", "/me", None).await.0, 200, "lock keeps sessions");
+    db.unlock_user(&alice_id).unwrap();
+    // Wrong old password and wrong code look the same and are counted.
+    let code = cjs_server::accounts::current_code(&secret);
+    let (st1, v1) = alice
+        .call(
+            "POST",
+            "/me/password",
+            Some(json!({"old": "wrong-password-x", "new": "a-new-password-123", "totp": code})),
+        )
+        .await;
+    let (st2, v2) = alice
+        .call(
+            "POST",
+            "/me/password",
+            Some(json!({"old": pw, "new": "a-new-password-123", "totp": "000000"})),
+        )
+        .await;
+    assert_eq!((st1, st2), (403, 403));
+    assert_eq!(v1["error"]["message"], v2["error"]["message"]);
+    assert_eq!(db.user(&alice_id).unwrap().unwrap().failed_logins, 2);
+    assert!(env
+        .audit_kinds()
+        .contains(&("auth.password_change".into(), "denied".into())));
+    // Concurrent failures from one address: exactly the budget is checked.
+    let url = format!("{}api/v1/login", env.url);
+    let http = reqwest::Client::new();
+    let hs: Vec<_> = (0..30)
+        .map(|i| {
+            let (http, url) = (http.clone(), url.clone());
+            tokio::spawn(async move {
+                http.post(url)
+                    .json(&json!({"name": format!("nobody{i}"), "password": "x", "totp": "1"}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            })
+        })
+        .collect();
+    let mut checked = 0;
+    for h in hs {
+        if h.await.unwrap() == 401 {
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 20);
+}
+
+/// A5b — Inventory: users without an administrative role only see devices
+/// their agents are granted, without keys, and only their own groups.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn c15_inventory_visible_only_when_granted() {
+    let env = Env::start(mode()).await;
+    let alice = env.web("alice").await;
+    let admin = env.web("admin").await;
+    let g = json!({"name": "secret-boxes", "kind": "device"});
+    assert_eq!(admin.call("POST", "/groups", Some(g)).await.0, 200);
+    let (_, v) = alice.call("GET", "/devices", None).await;
+    assert_eq!(v, json!([]));
+    let (_, v) = alice.call("GET", "/groups", None).await;
+    assert_eq!(v, json!([]));
+    env.put_grant(&env.grant("g1", &[Action::Exec]));
+    let (_, v) = alice.call("GET", "/devices", None).await;
+    let list = v.as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["id"], env.device_id);
+    assert!(list[0].get("pubkey").is_none());
+    let (_, v) = admin.call("GET", "/devices", None).await;
+    assert!(v[0]["pubkey"].is_string());
+}
+
+/// A1b — Enrollment: a failed enrollment (duplicate name) does not consume
+/// the token or audit success; an owner cannot delete a disabled agent, and
+/// a deleted disabled agent's key cannot be enrolled again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn c16_enrollment_atomic_and_revoked_keys() {
+    let env = Env::start(mode()).await;
+    let srv = &env.server;
+    let ok_enrolls = |env: &Env| {
+        env.audit_kinds()
+            .iter()
+            .filter(|(k, o)| k.starts_with("enroll.") && o == "success")
+            .count()
+    };
+    // Two tokens for the same name; the first one wins.
+    let (_, first) = srv
+        .create_enroll_token(ClientRole::Device, "dev9", None, &env.admin, 600)
+        .unwrap();
+    let (row, tok) = srv
+        .create_enroll_token(ClientRole::Device, "dev9", None, &env.admin, 600)
+        .unwrap();
+    enroll(
+        &env.tmp().join("d9"),
+        ClientRole::Device,
+        &env.url,
+        &first,
+        env.mode,
+        None,
+        "t",
+    )
+    .await
+    .unwrap();
+    let before = ok_enrolls(&env);
+    let e = enroll(
+        &env.tmp().join("dup"),
+        ClientRole::Device,
+        &env.url,
+        &tok,
+        env.mode,
+        None,
+        "t",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict, "{e}");
+    assert_eq!(ok_enrolls(&env), before);
+    let unused = srv
+        .shared
+        .db
+        .enroll_tokens()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.id == row.id)
+        .unwrap();
+    assert!(unused.used_at.is_none(), "token not consumed");
+    // Owner disables, cannot delete; sysadmin deletes -> key revoked.
+    let alice = env.web("alice").await;
+    let admin = env.web("admin").await;
+    let path = format!("/agents/{}", env.agent_id);
+    assert_eq!(
+        alice
+            .call("PATCH", &path, Some(json!({"status": "disabled"})))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(alice.call("DELETE", &path, None).await.0, 403);
+    assert_eq!(admin.call("DELETE", &path, None).await.0, 200);
+    let (_, tok) = srv
+        .create_enroll_token(
+            ClientRole::Agent,
+            "agent1-again",
+            Some(&env.owner),
+            &env.owner,
+            600,
+        )
+        .unwrap();
+    let e = enroll(
+        &env.agent_dir,
+        ClientRole::Agent,
+        &env.url,
+        &tok,
+        env.mode,
+        None,
+        "t",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Forbidden, "{e}");
 }
